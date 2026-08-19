@@ -7,6 +7,7 @@
 
 class Motor {
 private:
+    HardwareSerial* serialPort;
     TMC2209Stepper* driver;
     uint8_t stepPin;
     uint8_t dirPin;
@@ -31,7 +32,7 @@ private:
     static void IRAM_ATTR onStepTimer(void* arg);
 
 public:
-    Motor(HardwareSerial* serialPort, float rSense, uint8_t uartAddress,
+    Motor(HardwareSerial* serial, float rSense, uint8_t uartAddress,
           uint8_t stepPinNum, uint8_t dirPinNum = 255, const char* motorLabel = "Motor");
     ~Motor();
 
@@ -46,7 +47,7 @@ public:
     void setSpeed(uint32_t intervalUs);
     void setCurrent(uint16_t mA);
     void setHold(uint8_t scale);
-    void setChopperMode(bool spreadCycle); // true = SpreadCycle, false = StealthChop
+    void setChopperMode(bool spreadCycle);
     void setMicrosteps(uint16_t ms);
 
     void update();

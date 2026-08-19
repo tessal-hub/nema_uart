@@ -27,16 +27,15 @@ void MotionController::updateStepsPerDegree() {
 }
 
 float MotionController::normalizeAngle(float a) {
-    while (a < 0.0f) a += 360.0f;
-    while (a >= 360.0f) a -= 360.0f;
-    return a;
+    float res = fmodf(a, 360.0f);
+    if (res < 0.0f) res += 360.0f;
+    return res;
 }
 
 float MotionController::getShortestAngleError(float target, float current) {
-    float diff = target - current;
-    while (diff > 180.0f) diff -= 360.0f;
-    while (diff < -180.0f) diff += 360.0f;
-    return diff;
+    float diff = fmodf(target - current + 180.0f, 360.0f);
+    if (diff < 0.0f) diff += 360.0f;
+    return diff - 180.0f;
 }
 
 void MotionController::begin() {

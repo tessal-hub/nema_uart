@@ -1,8 +1,9 @@
 #include "motor.h"
 
-Motor::Motor(HardwareSerial* serialPort, float rSense, uint8_t uartAddress,
+Motor::Motor(HardwareSerial* serial, float rSense, uint8_t uartAddress,
              uint8_t stepPinNum, uint8_t dirPinNum, const char* motorLabel)
-    : driver(nullptr),
+    : serialPort(serial),
+      driver(nullptr),
       stepPin(stepPinNum),
       dirPin(dirPinNum),
       address(uartAddress),
@@ -21,7 +22,7 @@ Motor::Motor(HardwareSerial* serialPort, float rSense, uint8_t uartAddress,
       driverVersion(0),
       stepTimer(nullptr)
 {
-    driver = new TMC2209Stepper(serialPort, rSense, uartAddress);
+    driver = new TMC2209Stepper(serial, rSense, uartAddress);
 }
 
 Motor::~Motor() {
@@ -51,6 +52,11 @@ void IRAM_ATTR Motor::onStepTimer(void* arg) {
 }
 
 bool Motor::testUART() {
+    if (serialPort != nullptr) {
+        while (serialPort->available()) {
+            serialPort->read();
+        }
+    }
     uint8_t v = driver->version();
     driverVersion = v;
     uartOk = (v == 0x21); // TMC2209 returns 0x21
@@ -135,7 +141,10 @@ void Motor::run(bool cw, uint32_t steps) {
 
     if (stepTimer != nullptr) {
         esp_timer_stop(stepTimer);
-        esp_timer_start_periodic(stepTimer, stepIntervalUs);
+        uint32_t interval = stepIntervalUs;
+        if (interval < 100) interval = 100;
+        if (interval > 10000) interval = 10000;
+        esp_timer_start_periodic(stepTimer, interval);
     }
 }
 
@@ -160,6 +169,8 @@ void Motor::enable(bool en) {
 }
 
 void Motor::setSpeed(uint32_t intervalUs) {
+    if (intervalUs < 100) intervalUs = 100;
+    if (intervalUs > 10000) intervalUs = 10000;
     stepIntervalUs = intervalUs;
     if (running && stepTimer != nullptr) {
         esp_timer_stop(stepTimer);
@@ -207,7 +218,7 @@ void Motor::setStallGuardThreshold(uint8_t threshold) {
 }
 
 void Motor::setupStallGuard(uint8_t threshold, uint32_t tcoolthrs) {
-    setChopperMode(false); // StallGuard4 requires StealthChop
+    setChopperMode(false);
     driver->pwm_autoscale(true);
     driver->pwm_autograd(true);
     driver->TCOOLTHRS(tcoolthrs);
