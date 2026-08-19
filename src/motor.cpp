@@ -1,9 +1,10 @@
 #include "motor.h"
 
 Motor::Motor(HardwareSerial* serialPort, float rSense, uint8_t uartAddress,
-             uint8_t stepPinNum, const char* motorLabel)
+             uint8_t stepPinNum, uint8_t dirPinNum, const char* motorLabel)
     : driver(nullptr),
       stepPin(stepPinNum),
+      dirPin(dirPinNum),
       address(uartAddress),
       label(motorLabel),
       running(false),
@@ -16,6 +17,8 @@ Motor::Motor(HardwareSerial* serialPort, float rSense, uint8_t uartAddress,
       microstepsVal(16),
       holdScale(8),
       enabled(true),
+      uartOk(false),
+      driverVersion(0),
       stepTimer(nullptr)
 {
     driver = new TMC2209Stepper(serialPort, rSense, uartAddress);
@@ -47,10 +50,22 @@ void IRAM_ATTR Motor::onStepTimer(void* arg) {
     }
 }
 
+bool Motor::testUART() {
+    uint8_t v = driver->version();
+    driverVersion = v;
+    uartOk = (v == 0x21); // TMC2209 returns 0x21
+    return uartOk;
+}
+
 void Motor::begin(uint16_t initialCurrentMa, uint16_t initialMicrosteps,
                    bool initialSpreadCycle, uint8_t initialHoldScale, uint8_t iholddelay) {
     pinMode(stepPin, OUTPUT);
     digitalWrite(stepPin, LOW);
+
+    if (dirPin != 255) {
+        pinMode(dirPin, OUTPUT);
+        digitalWrite(dirPin, LOW);
+    }
 
     if (stepTimer != nullptr) {
         esp_timer_stop(stepTimer);
@@ -85,6 +100,19 @@ void Motor::begin(uint16_t initialCurrentMa, uint16_t initialMicrosteps,
     holdScale = initialHoldScale;
     driver->ihold(holdScale);
     driver->iholddelay(iholddelay);
+
+    // Initial direction
+    driver->shaft(false);
+
+    // Test UART connection
+    testUART();
+    if (uartOk) {
+        Serial.printf("  >> [TMC2209 OK] %s (Addr %u, STEP Pin %d): UART Ket noi tot! Version: 0x%02X\n",
+                      label, address, stepPin, driverVersion);
+    } else {
+        Serial.printf("  >> [TMC2209 CANH BAO] %s (Addr %u, STEP Pin %d): KHONG PHAN HOI UART! Version: 0x%02X (Kiem tra chan MS1/MS2 hoac noi DIR pin)\n",
+                      label, address, stepPin, driverVersion);
+    }
 }
 
 void Motor::run(bool cw, uint32_t steps) {
@@ -92,6 +120,13 @@ void Motor::run(bool cw, uint32_t steps) {
         enable(true);
     }
     dirCW = cw;
+
+    // 1. Hardware DIR pin control (if available)
+    if (dirPin != 255) {
+        digitalWrite(dirPin, cw ? HIGH : LOW);
+    }
+
+    // 2. UART register direction control
     driver->shaft(!cw);
 
     stepsRemaining = steps;
@@ -105,12 +140,12 @@ void Motor::run(bool cw, uint32_t steps) {
 }
 
 void Motor::stop() {
-    running = false;
-    stepsRemaining = 0;
-    targetSteps = 0;
     if (stepTimer != nullptr) {
         esp_timer_stop(stepTimer);
     }
+    running = false;
+    stepsRemaining = 0;
+    targetSteps = 0;
     digitalWrite(stepPin, LOW);
 }
 
@@ -172,17 +207,13 @@ void Motor::setStallGuardThreshold(uint8_t threshold) {
 }
 
 void Motor::setupStallGuard(uint8_t threshold, uint32_t tcoolthrs) {
-    setChopperMode(false); // StallGuard4 yêu cầu StealthChop
+    setChopperMode(false); // StallGuard4 requires StealthChop
     driver->pwm_autoscale(true);
     driver->pwm_autograd(true);
     driver->TCOOLTHRS(tcoolthrs);
     driver->SGTHRS(threshold);
     driver->semin(0);
     driver->semax(0);
-}
-
-uint32_t Motor::getDriverVersion() {
-    return driver->version();
 }
 
 String Motor::toJson() const {
@@ -195,7 +226,9 @@ String Motor::toJson() const {
     j += "\"currentMa\":" + String(currentMa) + ",";
     j += "\"holdScale\":" + String(holdScale) + ",";
     j += "\"spreadCycle\":" + String(spreadCycleMode ? "true" : "false") + ",";
-    j += "\"microsteps\":" + String(microstepsVal);
+    j += "\"microsteps\":" + String(microstepsVal) + ",";
+    j += "\"uartOk\":" + String(uartOk ? "true" : "false") + ",";
+    j += "\"version\":" + String(driverVersion);
     j += "}";
     return j;
 }

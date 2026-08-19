@@ -28,7 +28,7 @@
 #define SENSOR_I2C_MUTEX_TIMEOUT_MS  5
 
 // ==============================================================================
-// 3. TMC2209 STEPPER DRIVERS (DUAL HARDWARE UART & STEP PINS)
+// 3. TMC2209 STEPPER DRIVERS (DUAL HARDWARE UART & STEP/DIR PINS)
 // ==============================================================================
 #define R_SENSE 0.11f
 
@@ -50,6 +50,14 @@
 #define STEP_PIN_4    21
 #define STEP_PIN_5    14
 
+// Optional dedicated DIR pins (Set to 255 if using UART-only direction control, or assign GPIO if wired)
+#define DIR_PIN_0     255
+#define DIR_PIN_1     255
+#define DIR_PIN_2     255
+#define DIR_PIN_3     255
+#define DIR_PIN_4     255
+#define DIR_PIN_5     255
+
 // ==============================================================================
 // 4. MOTION & CONTROL DEFAULTS
 // ==============================================================================
@@ -64,6 +72,9 @@
 #define DEFAULT_DEADBAND_ENTER    0.3f     // Enter holding window (degrees)
 #define DEFAULT_DEADBAND_EXIT     0.8f     // Exit holding window on disturbance (degrees)
 #define DEFAULT_ANGLE_TOLERANCE   0.5f     // Positioning target tolerance (degrees)
+
+// Runaway safety threshold (stops motor if error grows by this amount in closed loop)
+#define RUNAWAY_ERROR_THRESHOLD   5.0f     // degrees
 
 // Motion Control Task configuration (Core 1, 100Hz)
 #define MOTION_TASK_PERIOD_MS     10

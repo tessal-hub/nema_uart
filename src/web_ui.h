@@ -42,6 +42,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         .badge-online { background: rgba(46, 160, 67, 0.2); color: #3fb950; border: 1px solid #2ea043; }
         .badge-homed { background: rgba(88, 166, 255, 0.2); color: #58a6ff; border: 1px solid #58a6ff; }
         .badge-unhomed { background: rgba(210, 153, 34, 0.2); color: #d29922; border: 1px solid #d29922; }
+        .badge-danger { background: rgba(248, 81, 73, 0.2); color: #f85149; border: 1px solid #f85149; }
+
+        /* BANNER */
+        .alert-banner {
+            background: rgba(248, 81, 73, 0.15); border: 1px solid var(--danger); border-radius: 10px;
+            padding: 12px 16px; color: #ff7b72; font-size: 0.88rem; font-weight: 600; display: none; align-items: center; gap: 8px;
+        }
 
         /* 6-AXIS SUMMARY GRID */
         .overview-grid {
@@ -180,6 +187,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         </div>
     </header>
 
+    <!-- ALERT BANNER -->
+    <div id="alert-runaway" class="alert-banner">
+        <span>⚠️</span>
+        <span id="alert-runaway-msg">CẢNH BÁO: Động cơ đang quay ngược chiều cảm biến (Góc đi xa hơn mục tiêu)! Đã tự động dừng. Vui lòng bật công tắc "Đảo Chiều Motor (Invert)".</span>
+    </div>
+
     <!-- 6-AXIS SUMMARY OVERVIEW -->
     <div class="overview-grid" id="axis-overview-grid">
         <!-- Generated dynamically via JS for J1..J6 -->
@@ -203,7 +216,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             <div class="card">
                 <div class="card-title">
                     <span id="lbl-active-joint">🧭 Joint 1 - Góc Hiện Tại</span>
-                    <span id="state-motion" class="badge badge-online">ĐỨNG YÊN</span>
+                    <div style="display:flex; gap:6px; align-items:center;">
+                        <span id="state-uart" class="badge badge-online">UART OK</span>
+                        <span id="state-motion" class="badge badge-online">ĐỨNG YÊN</span>
+                    </div>
                 </div>
 
                 <!-- GAUGE SVG -->
@@ -332,6 +348,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                         <div id="stat-sensor" class="stat-val" style="color:#3fb950;">OK</div>
                     </div>
                     <div class="stat-item">
+                        <div class="stat-name">Giao Tiếp TMC2209</div>
+                        <div id="stat-uart-val" class="stat-val">OK (v0x21)</div>
+                    </div>
+                    <div class="stat-item">
                         <div class="stat-name">Từ Trường (AGC / Mag)</div>
                         <div id="stat-mag" class="stat-val">128 / 141</div>
                     </div>
@@ -356,8 +376,19 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
             <!-- MOTOR SETTINGS -->
             <div class="card">
-                <div class="card-title">⚙️ Cấu Hình Trục & Deadband</div>
+                <div class="card-title">⚙️ Cấu Hình Trục & Đảo Chiều (Invert)</div>
                 
+                <div class="switch-row">
+                    <div>
+                        <div class="switch-label">Đảo Chiều Motor (Invert)</div>
+                        <div class="switch-sub">Bật nếu động cơ quay làm góc xa hơn mục tiêu</div>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="chk-invert" onchange="sendConfig()">
+                        <span class="slider-round"></span>
+                    </label>
+                </div>
+
                 <div class="switch-row">
                     <div>
                         <div class="switch-label">Giữ Góc Vòng Kín (Hold)</div>
@@ -365,17 +396,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                     </div>
                     <label class="toggle">
                         <input type="checkbox" id="chk-hold" onchange="sendConfig()">
-                        <span class="slider-round"></span>
-                    </label>
-                </div>
-
-                <div class="switch-row">
-                    <div>
-                        <div class="switch-label">Đảo Chiều Motor (Invert)</div>
-                        <div class="switch-sub">Đảo chiều quay so với cảm biến</div>
-                    </div>
-                    <label class="toggle">
-                        <input type="checkbox" id="chk-invert" onchange="sendConfig()">
                         <span class="slider-round"></span>
                     </label>
                 </div>
@@ -503,11 +523,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 latestData.axes.forEach((ax, i) => {
                     const isAct = (i === activeAxis) ? 'active' : '';
                     const okTag = ax.as5600_ok ? '<span style="color:#3fb950;">●</span>' : '<span style="color:#f85149;">●</span>';
+                    const uartTag = ax.uart_ok ? '' : '<span style="color:#f85149; font-size:0.65rem;">[NO UART]</span>';
                     const runTag = ax.isRunning ? '<span style="color:#58a6ff;">QUAY</span>' : '<span style="color:#8b949e;">TĨNH</span>';
                     html += `
                     <div class="axis-card ${isAct}" onclick="selectTab(${i})">
                         <div class="axis-head">
-                            <span class="axis-name">JOINT ${i + 1} ${okTag}</span>
+                            <span class="axis-name">JOINT ${i + 1} ${okTag} ${uartTag}</span>
                             <span style="font-size:0.72rem; font-weight:700;">${runTag}</span>
                         </div>
                         <div class="axis-deg">${ax.currentAngle.toFixed(1)}°</div>
@@ -545,6 +566,28 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 updatePointer(ax.currentAngle, false);
                 updatePointer(ax.targetAngle, true);
 
+                // Runaway alert banner
+                const alertRunaway = document.getElementById('alert-runaway');
+                if (ax.runaway_error) {
+                    alertRunaway.style.display = 'flex';
+                    document.getElementById('alert-runaway-msg').innerText = 
+                        `⚠️ CẢNH BÁO JOINT ${activeAxis + 1}: Động cơ quay làm sai số tăng lên (ngược chiều cảm biến)! Đã dừng an toàn. Hãy gạt công tắc [Đảo Chiều Motor (Invert)] bên dưới!`;
+                } else {
+                    alertRunaway.style.display = 'none';
+                }
+
+                // UART badge
+                const uartBadge = document.getElementById('state-uart');
+                if (uartBadge) {
+                    if (ax.uart_ok) {
+                        uartBadge.className = "badge badge-online";
+                        uartBadge.innerText = `UART OK (0x${ax.driver_version.toString(16).toUpperCase()})`;
+                    } else {
+                        uartBadge.className = "badge badge-danger";
+                        uartBadge.innerText = `MẤT UART (0x${ax.driver_version.toString(16).toUpperCase()})`;
+                    }
+                }
+
                 const motionBadge = document.getElementById('state-motion');
                 if (ax.isRunning) {
                     motionBadge.innerText = "ĐANG QUAY";
@@ -569,6 +612,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
                 document.getElementById('stat-sensor').innerText = ax.as5600_ok ? "OK" : "LỖI I2C";
                 document.getElementById('stat-sensor').style.color = ax.as5600_ok ? "#3fb950" : "#f85149";
+                
+                const statUart = document.getElementById('stat-uart-val');
+                if (statUart) {
+                    statUart.innerText = ax.uart_ok ? `OK (v0x${ax.driver_version.toString(16).toUpperCase()})` : `LỖI (v0x${ax.driver_version.toString(16).toUpperCase()})`;
+                    statUart.style.color = ax.uart_ok ? "#3fb950" : "#f85149";
+                }
+
                 document.getElementById('stat-mag').innerText = `${ax.agc} / ${ax.magnitude}`;
                 document.getElementById('stat-raw').innerText = ax.rawAngle.toFixed(2) + '°';
                 document.getElementById('stat-stroke').innerText = ax.totalStroke.toFixed(2) + '°';

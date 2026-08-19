@@ -12,6 +12,7 @@ MotionController::MotionController(uint8_t axisIndex, Motor* m, Sensor* s)
       baseIntervalUs(DEFAULT_STEP_INTERVAL_US),
       positioningActive(false), closedLoopHold(false),
       dirInvert(false), reachedTarget(false),
+      runawayDetected(false), lastObservedError(0.0f), activeMoveStartMs(0),
       isHomed(false), zeroOffsetAngle(0.0f),
       totalStrokeDeg(0.0f), limitLeftDeg(0.0f), limitRightDeg(0.0f),
       normalCurrentMa(DEFAULT_NORMAL_CURRENT), homingCurrentMa(DEFAULT_HOMING_CURRENT),
@@ -167,6 +168,7 @@ void MotionController::runAutoCalibration() {
     positioningActive = false;
     closedLoopHold = false;
     inDeadband = false;
+    runawayDetected = false;
     motor->stop();
     calibData.isCalibrated = false;
     delay(300);
@@ -273,6 +275,7 @@ void MotionController::runCenterHoming(bool isDebug) {
     positioningActive = false;
     closedLoopHold = false;
     inDeadband = false;
+    runawayDetected = false;
     motor->stop();
     delay(200);
 
@@ -368,6 +371,9 @@ void MotionController::setTargetAngle(float target) {
     positioningActive = true;
     reachedTarget = false;
     inDeadband = false;
+    runawayDetected = false;
+    lastObservedError = fabs(getShortestAngleError(targetAngle, getHomeRelativeAngle()));
+    activeMoveStartMs = millis();
 }
 
 void MotionController::jog(float delta) {
@@ -385,6 +391,7 @@ void MotionController::moveRawSteps(bool cw, uint32_t steps, uint32_t speedUs) {
     positioningActive = false;
     closedLoopHold = false;
     inDeadband = false;
+    runawayDetected = false;
     if (speedUs >= 100 && speedUs <= 5000) {
         motor->setSpeed(speedUs);
     } else {
@@ -399,6 +406,7 @@ void MotionController::runContinuous(bool cw, uint32_t speedUs) {
     positioningActive = false;
     closedLoopHold = false;
     inDeadband = false;
+    runawayDetected = false;
     if (speedUs >= 100 && speedUs <= 5000) {
         motor->setSpeed(speedUs);
     } else {
@@ -453,7 +461,7 @@ void MotionController::update() {
         runAutoCalibration();
     }
 
-    // 3. Vòng điều khiển vị trí bám góc (Closed-loop với Schmitt-Trigger Deadband)
+    // 3. Vòng điều khiển vị trí bám góc (Closed-loop với Schmitt-Trigger Deadband & Runaway Protection)
     if (!positioningActive && !closedLoopHold) return;
 
     currentAngle = getHomeRelativeAngle();
@@ -467,12 +475,26 @@ void MotionController::update() {
     float err = getShortestAngleError(targetAngle, currentAngle);
     float absErr = fabs(err);
 
+    // Runaway Protection: Kiểm tra nếu động cơ quay làm sai số TĂNG LÊN thay vì giảm đi (Ngược chiều Invert)
+    if (motor->isRunning() && (millis() - activeMoveStartMs > 300)) {
+        if (absErr > (lastObservedError + RUNAWAY_ERROR_THRESHOLD)) {
+            motor->stop();
+            positioningActive = false;
+            closedLoopHold = false;
+            runawayDetected = true;
+            Serial.printf(">> [CANH BAO NGUOC CHIEU J%u] Sai so tang tu %.1f do -> %.1f do! Da dung an toan. Vui long bat Invert (dao chieu)!\n",
+                          axisId + 1, lastObservedError, absErr);
+            return;
+        }
+    }
+
     // Schmitt-Trigger Deadband Logic
     if (inDeadband) {
-        // Stay sleeping until disturbance exceeds exit threshold
         if (absErr > deadbandExit) {
             inDeadband = false;
             reachedTarget = false;
+            lastObservedError = absErr;
+            activeMoveStartMs = millis();
         } else {
             return;
         }
@@ -507,6 +529,8 @@ void MotionController::update() {
             interval = (uint32_t)(baseIntervalUs * 1.4f);
         }
         motor->setSpeed(interval);
+        lastObservedError = absErr;
+        activeMoveStartMs = millis();
         motor->run(dir, neededSteps);
     }
 }

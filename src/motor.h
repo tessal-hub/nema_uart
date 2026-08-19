@@ -9,6 +9,7 @@ class Motor {
 private:
     TMC2209Stepper* driver;
     uint8_t stepPin;
+    uint8_t dirPin;
     uint8_t address;
     const char* label;
 
@@ -23,12 +24,15 @@ private:
     volatile uint8_t holdScale;
     volatile bool enabled;
 
+    bool uartOk;
+    uint8_t driverVersion;
+
     esp_timer_handle_t stepTimer;
     static void IRAM_ATTR onStepTimer(void* arg);
 
 public:
     Motor(HardwareSerial* serialPort, float rSense, uint8_t uartAddress,
-          uint8_t stepPinNum, const char* motorLabel = "Motor");
+          uint8_t stepPinNum, uint8_t dirPinNum = 255, const char* motorLabel = "Motor");
     ~Motor();
 
     void begin(uint16_t initialCurrentMa = 700, uint16_t initialMicrosteps = 16,
@@ -46,6 +50,11 @@ public:
     void setMicrosteps(uint16_t ms);
 
     void update();
+
+    // --- Diagnostic & UART verification ---
+    bool testUART();
+    bool isUartOK() const { return uartOk; }
+    uint8_t getDriverVersion() const { return driverVersion; }
 
     // --- StallGuard4 / Sensorless Homing ---
     uint16_t getStallGuardResult();
@@ -66,9 +75,9 @@ public:
     bool getSpreadCycle() const { return spreadCycleMode; }
     uint16_t getMicrosteps() const { return microstepsVal; }
     uint8_t getAddress() const { return address; }
+    uint8_t getStepPin() const { return stepPin; }
+    uint8_t getDirPin() const { return dirPin; }
     const char* getLabel() const { return label; }
-
-    uint32_t getDriverVersion();
 
     String toJson() const;
 };

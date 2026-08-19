@@ -108,6 +108,9 @@ void WebServerManager::handleStatus() {
         json += "\"isRunning\":" + String((m && m->isRunning()) ? "true" : "false") + ",";
         json += "\"driver_enabled\":" + String((m && m->isEnabled()) ? "true" : "false") + ",";
         json += "\"inDeadband\":" + String((mc && mc->isInDeadband()) ? "true" : "false") + ",";
+        json += "\"runaway_error\":" + String((mc && mc->isRunawayDetected()) ? "true" : "false") + ",";
+        json += "\"uart_ok\":" + String((m && m->isUartOK()) ? "true" : "false") + ",";
+        json += "\"driver_version\":" + String(m ? m->getDriverVersion() : 0) + ",";
         json += "\"totalStroke\":" + String(mc ? mc->getTotalStroke() : 0.0f, 2) + ",";
         json += "\"limitLeft\":" + String(mc ? mc->getLimitLeft() : 0.0f, 2) + ",";
         json += "\"limitRight\":" + String(mc ? mc->getLimitRight() : 0.0f, 2) + ",";

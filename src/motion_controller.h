@@ -45,6 +45,9 @@ private:
     bool closedLoopHold;
     bool dirInvert;
     bool reachedTarget;
+    bool runawayDetected;
+    float lastObservedError;
+    uint32_t activeMoveStartMs;
 
     bool isHomed;
     float zeroOffsetAngle;
@@ -119,15 +122,17 @@ public:
     float getDeadbandEnter() const { return deadbandEnter; }
     float getDeadbandExit() const { return deadbandExit; }
     bool isInDeadband() const { return inDeadband; }
+    bool isRunawayDetected() const { return runawayDetected; }
     const CalibData& getCalibData() const { return calibData; }
 
     void setSpeed(uint32_t speedUs);
     void setCurrent(uint16_t ma);
     void setGearRatio(float ratio);
     void setClosedLoopHold(bool hold) { closedLoopHold = hold; saveSettings(); }
-    void setDirInvert(bool invert) { dirInvert = invert; saveSettings(); }
+    void setDirInvert(bool invert) { dirInvert = invert; runawayDetected = false; saveSettings(); }
     void setTolerance(float tol) { if (tol >= 0.05f && tol <= 10.0f) angleTolerance = tol; }
     void setDeadband(float enterDeg, float exitDeg);
+    void resetRunaway() { runawayDetected = false; }
 };
 
 #endif // MOTION_CONTROLLER_H

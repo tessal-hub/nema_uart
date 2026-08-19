@@ -7,12 +7,12 @@
 #include "web_server_manager.h"
 
 // --- 1. KHỞI TẠO 6 MOTOR TRÊN 2 CỔNG HARDWARE UART ---
-Motor motor0(&SERIAL_PORT_1, R_SENSE, 0b00, STEP_PIN_0, "Motor 1");
-Motor motor1(&SERIAL_PORT_1, R_SENSE, 0b01, STEP_PIN_1, "Motor 2");
-Motor motor2(&SERIAL_PORT_1, R_SENSE, 0b10, STEP_PIN_2, "Motor 3");
-Motor motor3(&SERIAL_PORT_1, R_SENSE, 0b11, STEP_PIN_3, "Motor 4");
-Motor motor4(&SERIAL_PORT_2, R_SENSE, 0b00, STEP_PIN_4, "Motor 5");
-Motor motor5(&SERIAL_PORT_2, R_SENSE, 0b01, STEP_PIN_5, "Motor 6");
+Motor motor0(&SERIAL_PORT_1, R_SENSE, 0b00, STEP_PIN_0, DIR_PIN_0, "Motor 1");
+Motor motor1(&SERIAL_PORT_1, R_SENSE, 0b01, STEP_PIN_1, DIR_PIN_1, "Motor 2");
+Motor motor2(&SERIAL_PORT_1, R_SENSE, 0b10, STEP_PIN_2, DIR_PIN_2, "Motor 3");
+Motor motor3(&SERIAL_PORT_1, R_SENSE, 0b11, STEP_PIN_3, DIR_PIN_3, "Motor 4");
+Motor motor4(&SERIAL_PORT_2, R_SENSE, 0b00, STEP_PIN_4, DIR_PIN_4, "Motor 5");
+Motor motor5(&SERIAL_PORT_2, R_SENSE, 0b01, STEP_PIN_5, DIR_PIN_5, "Motor 6");
 
 Motor* motorList[NUM_MOTORS] = { &motor0, &motor1, &motor2, &motor3, &motor4, &motor5 };
 
@@ -36,6 +36,18 @@ WebServerManager webServer(&axisManager, &sensor);
 String inputString = "";
 bool stringComplete = false;
 
+void testAllUarts() {
+    Serial.println("\n--- [KIEM TRA KET NOI TMC2209 UART] ---");
+    for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+        bool ok = motorList[i]->testUART();
+        uint8_t ver = motorList[i]->getDriverVersion();
+        Serial.printf("  Joint %d (M%d) [Addr %u, STEP Pin %d, DIR Pin %d]: %s (Version: 0x%02X)\n",
+                      i + 1, i, motorList[i]->getAddress(), motorList[i]->getStepPin(), motorList[i]->getDirPin(),
+                      ok ? "OK (Ket noi tot)" : "LOI UART (Khong phan hoi)", ver);
+    }
+    Serial.println("----------------------------------------\n");
+}
+
 void handleSerialCommand(String cmd) {
     cmd.trim();
     if (cmd.length() == 0) return;
@@ -44,6 +56,12 @@ void handleSerialCommand(String cmd) {
     if (cmd.equalsIgnoreCase("STOP") || cmd.equalsIgnoreCase("EMERGENCY STOP") || cmd.equalsIgnoreCase("S")) {
         axisManager.emergencyStopAll();
         Serial.println(">> [SERIAL] DA DUNG KHAN CAP TAT CA 6 TRUC!");
+        return;
+    }
+
+    // Lệnh kiểm tra UART
+    if (cmd.equalsIgnoreCase("TEST UART") || cmd.equalsIgnoreCase("UART") || cmd.equalsIgnoreCase("TEST")) {
+        testAllUarts();
         return;
     }
 
@@ -107,6 +125,10 @@ void handleSerialCommand(String cmd) {
         } else if (sub.equalsIgnoreCase("STOP")) {
             axisManager.stopJoint(axis);
             Serial.printf(">> [SERIAL M%d] Dung dong co.\n", axis + 1);
+        } else if (sub.startsWith("INVERT ") || sub.startsWith("invert ")) {
+            bool inv = sub.substring(7).toInt() == 1;
+            controllerList[axis]->setDirInvert(inv);
+            Serial.printf(">> [SERIAL M%d] Da cai dat Invert = %s\n", axis + 1, inv ? "TRUE" : "FALSE");
         } else if (sub.startsWith("STEP ") || sub.startsWith("step ")) {
             long st = sub.substring(5).toInt();
             if (st >= 0) axisManager.moveJointRawSteps(axis, true, (uint32_t)st);
@@ -128,7 +150,7 @@ void handleSerialCommand(String cmd) {
         return;
     }
 
-    Serial.println(">> [SERIAL] Cu phap khong hop le. Vi du: 'M1 45', 'M2 STEP 400', 'ALL 0 45 -30 90 0 0', 'STOP'");
+    Serial.println(">> [SERIAL] Cu phap: 'M1 45', 'M2 STEP 400', 'M3 INVERT 1', 'TEST UART', 'ALL 0 45 -30 90 0 0', 'STOP'");
 }
 
 void setup() {
@@ -155,7 +177,10 @@ void setup() {
     Serial.println("[INIT] Khoi dong 6-Axis Motion Control Task (Core 1, 100Hz)...");
     axisManager.begin(MOTION_TASK_CORE, MOTION_TASK_PRIORITY, MOTION_TASK_PERIOD_MS);
 
-    // 4. Khởi tạo Web Server & Wi-Fi Kép (AP + STA)
+    // 4. In kết quả kiểm tra UART của 6 driver
+    testAllUarts();
+
+    // 5. Khởi tạo Web Server & Wi-Fi Kép (AP + STA)
     webServer.begin("NEMA-6AXIS-CONTROLLER", "12345678");
 
     Serial.println("[READY] He thong 6 truc da san sang hoat dong!");
