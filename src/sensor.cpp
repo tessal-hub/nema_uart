@@ -1,10 +1,15 @@
 #include "sensor.h"
+#include <esp_task_wdt.h>
 
 Sensor::Sensor() {
     for (uint8_t i = 0; i < NUM_SENSORS; i++) {
         filtered_angles[i] = 0.0f;
+        last_raw_angles[i] = 0.0f;
+        accumulated_angles[i] = 0.0f;
+        turn_counts[i] = 0;
         initialized[i] = false;
         sensor_error[i] = false;
+        read_fail_counts[i] = 0;
     }
     dataMutex = nullptr;
     i2cMutex = nullptr;
@@ -26,9 +31,41 @@ Sensor::~Sensor() {
 }
 
 void Sensor::setPCAChannel(uint8_t channel) {
+    if (channel >= 8) return;
     Wire.beginTransmission(PCA_ADDR);
     Wire.write(1 << channel);
     Wire.endTransmission();
+}
+
+void Sensor::disableAllPCAChannels() {
+    Wire.beginTransmission(PCA_ADDR);
+    Wire.write(0x00);
+    Wire.endTransmission();
+}
+
+void Sensor::recoverI2CBus() {
+    Wire.end();
+    pinMode(SCL_PIN, OUTPUT);
+    pinMode(SDA_PIN, INPUT_PULLUP);
+
+    for (int i = 0; i < 9; i++) {
+        digitalWrite(SCL_PIN, HIGH);
+        delayMicroseconds(5);
+        digitalWrite(SCL_PIN, LOW);
+        delayMicroseconds(5);
+    }
+
+    pinMode(SDA_PIN, OUTPUT);
+    digitalWrite(SDA_PIN, LOW);
+    delayMicroseconds(5);
+    digitalWrite(SCL_PIN, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(SDA_PIN, HIGH);
+    delayMicroseconds(5);
+
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(I2C_FREQUENCY);
+    Wire.setTimeOut(15);
 }
 
 void Sensor::configureAS5600() {
@@ -68,10 +105,26 @@ float Sensor::filter(uint8_t ch, uint16_t raw) {
 
     if (!initialized[ch]) {
         filtered_angles[ch] = new_angle;
+        last_raw_angles[ch] = new_angle;
+        accumulated_angles[ch] = new_angle;
+        turn_counts[ch] = 0;
         initialized[ch] = true;
         return filtered_angles[ch];
     }
 
+    // Tính delta giữa 2 mẫu liên tiếp có bù trừ wrap-around ở 500Hz
+    float rawDelta = new_angle - last_raw_angles[ch];
+    if (rawDelta > 180.0f) {
+        rawDelta -= 360.0f;
+        turn_counts[ch]--;
+    } else if (rawDelta < -180.0f) {
+        rawDelta += 360.0f;
+        turn_counts[ch]++;
+    }
+    last_raw_angles[ch] = new_angle;
+    accumulated_angles[ch] += rawDelta;
+
+    // Lọc thông thấp Exponential Smoothing
     float delta = new_angle - filtered_angles[ch];
     if (delta > 180.0f) delta -= 360.0f;
     if (delta < -180.0f) delta += 360.0f;
@@ -93,14 +146,19 @@ void Sensor::scanOnce() {
         uint16_t raw = readRaw();
 
         if (raw > 4095) {
-            sensor_error[i] = true;
+            read_fail_counts[i]++;
+            if (read_fail_counts[i] > 5) {
+                sensor_error[i] = true;
+            }
             continue;
         }
+
+        read_fail_counts[i] = 0;
         sensor_error[i] = false;
 
         float angle = filter(i, raw);
 
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(SENSOR_I2C_MUTEX_TIMEOUT_MS)) == pdTRUE) {
+        if (dataMutex != nullptr && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(SENSOR_I2C_MUTEX_TIMEOUT_MS)) == pdTRUE) {
             filtered_angles[i] = angle;
             xSemaphoreGive(dataMutex);
         }
@@ -120,7 +178,11 @@ void Sensor::taskLoop() {
     );
     TickType_t lastWake = xTaskGetTickCount();
 
+    // Đăng ký Task Watchdog Timer
+    esp_task_wdt_add(nullptr);
+
     while (taskRunning) {
+        esp_task_wdt_reset();
         scanOnce();
 
         bool allInError = true;
@@ -132,6 +194,7 @@ void Sensor::taskLoop() {
         }
 
         if (allInError) {
+            recoverI2CBus();
             vTaskDelay(pdMS_TO_TICKS(50));
             lastWake = xTaskGetTickCount();
         } else {
@@ -139,13 +202,14 @@ void Sensor::taskLoop() {
         }
     }
 
+    esp_task_wdt_delete(nullptr);
     vTaskDelete(nullptr);
 }
 
 void Sensor::begin(uint8_t coreID, uint8_t priority, uint32_t period_ms) {
     Wire.begin(SDA_PIN, SCL_PIN);
-    Wire.setClock(400000);
-    Wire.setTimeOut(10);
+    Wire.setClock(I2C_FREQUENCY);
+    Wire.setTimeOut(15);
 
     dataMutex = xSemaphoreCreateMutex();
     i2cMutex = xSemaphoreCreateMutex();
@@ -171,12 +235,41 @@ void Sensor::begin(uint8_t coreID, uint8_t priority, uint32_t period_ms) {
 float Sensor::getAngle(uint8_t ch) {
     if (ch >= NUM_SENSORS) return -1.0f;
 
-    float value = filtered_angles[ch];
-    if (dataMutex != nullptr && xSemaphoreTake(dataMutex, 0) == pdTRUE) {
+    float value = 0.0f;
+    if (dataMutex != nullptr && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         value = filtered_angles[ch];
         xSemaphoreGive(dataMutex);
+    } else {
+        value = filtered_angles[ch]; // safe atomic read fallback
     }
     return value;
+}
+
+float Sensor::getAccumulatedAngle(uint8_t ch) {
+    if (ch >= NUM_SENSORS) return 0.0f;
+
+    float value = 0.0f;
+    if (dataMutex != nullptr && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        value = accumulated_angles[ch];
+        xSemaphoreGive(dataMutex);
+    } else {
+        value = accumulated_angles[ch];
+    }
+    return value;
+}
+
+int32_t Sensor::getTurnCount(uint8_t ch) {
+    if (ch >= NUM_SENSORS) return 0;
+    return turn_counts[ch];
+}
+
+void Sensor::resetAccumulatedAngle(uint8_t ch) {
+    if (ch >= NUM_SENSORS) return;
+    if (dataMutex != nullptr && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        accumulated_angles[ch] = filtered_angles[ch];
+        turn_counts[ch] = 0;
+        xSemaphoreGive(dataMutex);
+    }
 }
 
 bool Sensor::isSensorOK(uint8_t ch) {
@@ -198,9 +291,9 @@ AS5600Diag Sensor::getDiagnostics(uint8_t ch) {
         Wire.write(AS5600_STATUS_REG);
         if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint8_t)AS5600_ADDR, (uint8_t)1) == 1) {
             diag.status = Wire.read();
-            diag.magnetDetected = (diag.status & 0x20) != 0; // Bit 5: MD
-            diag.magnetTooLow   = (diag.status & 0x10) != 0; // Bit 4: ML
-            diag.magnetTooHigh  = (diag.status & 0x08) != 0; // Bit 3: MH
+            diag.magnetDetected = (diag.status & 0x20) != 0;
+            diag.magnetTooLow   = (diag.status & 0x10) != 0;
+            diag.magnetTooHigh  = (diag.status & 0x08) != 0;
             diag.readSuccess = true;
         }
 
@@ -271,6 +364,9 @@ AS5600Diag Sensor::getDiagnostics(uint8_t ch) {
         if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint8_t)AS5600_ADDR, (uint8_t)1) == 1) {
             diag.zmco = Wire.read() & 0x03;
         }
+
+        diag.magnetOptimal = diag.magnetDetected && !diag.magnetTooLow && !diag.magnetTooHigh &&
+                             (diag.agc >= AS5600_AGC_MIN_HEALTHY && diag.agc <= AS5600_AGC_MAX_HEALTHY);
 
         xSemaphoreGive(i2cMutex);
     }

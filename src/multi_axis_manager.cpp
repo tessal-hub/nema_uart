@@ -1,7 +1,10 @@
 #include "multi_axis_manager.h"
+#include <esp_task_wdt.h>
 
 MultiAxisManager::MultiAxisManager(Motor* mList[NUM_MOTORS], MotionController* cList[NUM_MOTORS], Sensor* s)
-    : sensor(s), ikHook(nullptr), taskHandle(nullptr), taskRunning(false) {
+    : sensor(s), ikHook(&defaultKinematics), waypointCount(0), currentWaypointIdx(-1),
+      sequenceRunning(false), sequenceLoop(false), waypointDwellStartMs(0), waitingDwell(false),
+      taskHandle(nullptr), taskRunning(false) {
     for (uint8_t i = 0; i < NUM_MOTORS; i++) {
         motors[i] = mList[i];
         controllers[i] = cList[i];
@@ -31,20 +34,79 @@ void MultiAxisManager::taskLoop() {
     );
     TickType_t lastWake = xTaskGetTickCount();
 
+    // Đăng ký Task Watchdog Timer
+    esp_task_wdt_add(nullptr);
+
     while (taskRunning) {
+        esp_task_wdt_reset();
+
         if (stateMutex != nullptr && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             for (uint8_t i = 0; i < NUM_MOTORS; i++) {
                 if (controllers[i] != nullptr) {
                     controllers[i]->update();
                 }
             }
+
+            // Xử lý quỹ đạo Waypoint tự động
+            if (sequenceRunning) {
+                processWaypointSequence();
+            }
+
             xSemaphoreGive(stateMutex);
         }
 
         vTaskDelayUntil(&lastWake, period);
     }
 
+    esp_task_wdt_delete(nullptr);
     vTaskDelete(nullptr);
+}
+
+void MultiAxisManager::processWaypointSequence() {
+    if (waypointCount == 0 || currentWaypointIdx < 0 || currentWaypointIdx >= waypointCount) {
+        sequenceRunning = false;
+        return;
+    }
+
+    // Kiểm tra xem tất cả các trục đã dừng và đạt góc đích chưa
+    bool anyMoving = false;
+    for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+        if (motors[i] != nullptr && motors[i]->isRunning()) {
+            anyMoving = true;
+            break;
+        }
+    }
+
+    if (!anyMoving) {
+        if (!waitingDwell) {
+            waypointDwellStartMs = millis();
+            waitingDwell = true;
+        } else {
+            uint32_t elapsed = millis() - waypointDwellStartMs;
+            if (elapsed >= waypoints[currentWaypointIdx].dwellTimeMs) {
+                waitingDwell = false;
+                currentWaypointIdx++;
+
+                if (currentWaypointIdx >= waypointCount) {
+                    if (sequenceLoop) {
+                        currentWaypointIdx = 0;
+                    } else {
+                        sequenceRunning = false;
+                        currentWaypointIdx = -1;
+                        Serial.println("[WAYPOINT] Hoan tat chuoi quy dao!");
+                        return;
+                    }
+                }
+
+                // Thực thi chuyển động đến Waypoint tiếp theo
+                setTargetAnglesSync(waypoints[currentWaypointIdx].joints,
+                                    waypoints[currentWaypointIdx].moveTimeSec,
+                                    true);
+                Serial.printf("[WAYPOINT] Chuyen sang diem %d/%d: %s\n",
+                              currentWaypointIdx + 1, waypointCount, waypoints[currentWaypointIdx].name);
+            }
+        }
+    }
 }
 
 void MultiAxisManager::begin(uint8_t coreID, uint8_t priority, uint32_t period_ms) {
@@ -111,6 +173,11 @@ void MultiAxisManager::triggerJointHome(uint8_t axis) {
     controllers[axis]->triggerHome();
 }
 
+void MultiAxisManager::triggerJointZero(uint8_t axis) {
+    if (axis >= NUM_MOTORS || controllers[axis] == nullptr) return;
+    controllers[axis]->triggerZero();
+}
+
 void MultiAxisManager::triggerJointCalib(uint8_t axis) {
     if (axis >= NUM_MOTORS || controllers[axis] == nullptr) return;
     controllers[axis]->triggerCalib();
@@ -145,7 +212,7 @@ void MultiAxisManager::setTargetAnglesSync(const float targets[NUM_MOTORS], floa
         }
     }
 
-    // Feasibility Clamping: Cannot move faster than physical max velocity allows
+    // Feasibility Clamping: Không thể chạy nhanh hơn giới hạn vận tốc phần cứng
     float actualDuration = (moveTimeSec > maxRequiredTime) ? moveTimeSec : maxRequiredTime;
 
     for (uint8_t i = 0; i < NUM_MOTORS; i++) {
@@ -157,13 +224,14 @@ void MultiAxisManager::setTargetAnglesSync(const float targets[NUM_MOTORS], floa
             float stepsPerSec = jointVelDegPerSec * stepsPerDeg;
 
             uint32_t intervalUs = (stepsPerSec > 1.0f) ? (uint32_t)(1000000.0f / stepsPerSec) : DEFAULT_STEP_INTERVAL_US;
-            if (intervalUs < 150) intervalUs = 150;
-            if (intervalUs > 2000) intervalUs = 2000;
+            if (intervalUs < MIN_STEP_INTERVAL_US) intervalUs = MIN_STEP_INTERVAL_US;
+            if (intervalUs > MAX_STEP_INTERVAL_US) intervalUs = MAX_STEP_INTERVAL_US;
 
-            motors[i]->setSpeed(intervalUs);
+            // Khóa vận tốc đồng bộ cho Controller
+            controllers[i]->setTargetAngleSync(targets[i], intervalUs);
+        } else {
+            controllers[i]->setTargetAngle(targets[i]);
         }
-
-        controllers[i]->setTargetAngle(targets[i]);
     }
 
     xSemaphoreGive(stateMutex);
@@ -171,8 +239,7 @@ void MultiAxisManager::setTargetAnglesSync(const float targets[NUM_MOTORS], floa
 
 bool MultiAxisManager::setCartesianPose(const CartesianPose& pose, const IKSolverParams& params, float moveTimeSec) {
     if (ikHook == nullptr) {
-        Serial.println("[IK] Kinematics solver hook not registered!");
-        return false;
+        ikHook = &defaultKinematics;
     }
 
     float currentJoints[NUM_MOTORS];
@@ -186,11 +253,41 @@ bool MultiAxisManager::setCartesianPose(const CartesianPose& pose, const IKSolve
         return true;
     }
 
-    Serial.println("[IK] IK Solver failed to reach target Cartesian pose within limits!");
+    Serial.println("[IK] IK Solver that bai khi tinh toan goc khop cho toa do yeu cau!");
     return false;
 }
 
+bool MultiAxisManager::moveCartesianLinear(const CartesianPose& targetPose, float speedMmPerSec) {
+    if (speedMmPerSec <= 1.0f) speedMmPerSec = 50.0f;
+
+    CartesianPose startPose = {0};
+    if (!getCartesianPose(startPose)) return false;
+
+    float dx = targetPose.x - startPose.x;
+    float dy = targetPose.y - startPose.y;
+    float dz = targetPose.z - startPose.z;
+    float distMm = sqrtf(dx * dx + dy * dy + dz * dz);
+
+    float durationSec = (distMm > 0.1f) ? (distMm / speedMmPerSec) : 0.5f;
+    if (durationSec < 0.2f) durationSec = 0.2f;
+
+    return setCartesianPose(targetPose, {100, 0.1f, 0.01f}, durationSec);
+}
+
+bool MultiAxisManager::getCartesianPose(CartesianPose& outPose) {
+    if (ikHook == nullptr) {
+        ikHook = &defaultKinematics;
+    }
+
+    float currentJoints[NUM_MOTORS];
+    getAllAngles(currentJoints);
+    return ikHook->solveFK(currentJoints, outPose);
+}
+
 void MultiAxisManager::emergencyStopAll() {
+    sequenceRunning = false;
+    currentWaypointIdx = -1;
+
     if (stateMutex != nullptr && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         for (uint8_t i = 0; i < NUM_MOTORS; i++) {
             if (controllers[i] != nullptr) {
@@ -199,11 +296,27 @@ void MultiAxisManager::emergencyStopAll() {
         }
         xSemaphoreGive(stateMutex);
     } else {
-        // Direct stop fallback if mutex is blocked
+        // Fallback trực tiếp nếu mutex bị khóa
         for (uint8_t i = 0; i < NUM_MOTORS; i++) {
             if (motors[i] != nullptr) {
                 motors[i]->stop();
             }
+        }
+    }
+}
+
+void MultiAxisManager::triggerAllHome() {
+    for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+        if (controllers[i] != nullptr) {
+            controllers[i]->triggerHome();
+        }
+    }
+}
+
+void MultiAxisManager::triggerAllZero() {
+    for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+        if (controllers[i] != nullptr) {
+            controllers[i]->triggerZero();
         }
     }
 }
@@ -217,6 +330,54 @@ void MultiAxisManager::setAllDriversEnabled(bool enabled) {
         }
         xSemaphoreGive(stateMutex);
     }
+}
+
+bool MultiAxisManager::addWaypoint(const char* name, const float joints[NUM_MOTORS], float moveTimeSec, uint16_t dwellMs) {
+    if (waypointCount >= MAX_WAYPOINTS) return false;
+
+    strncpy(waypoints[waypointCount].name, name, sizeof(waypoints[waypointCount].name) - 1);
+    waypoints[waypointCount].name[sizeof(waypoints[waypointCount].name) - 1] = '\0';
+
+    for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+        waypoints[waypointCount].joints[i] = joints[i];
+    }
+    waypoints[waypointCount].moveTimeSec = (moveTimeSec > 0.1f) ? moveTimeSec : 2.0f;
+    waypoints[waypointCount].dwellTimeMs = dwellMs;
+
+    if (ikHook != nullptr) {
+        ikHook->solveFK(joints, waypoints[waypointCount].pose);
+    }
+
+    waypointCount++;
+    return true;
+}
+
+void MultiAxisManager::clearWaypoints() {
+    sequenceRunning = false;
+    currentWaypointIdx = -1;
+    waypointCount = 0;
+}
+
+void MultiAxisManager::startSequence(bool loop) {
+    if (waypointCount == 0) return;
+    sequenceLoop = loop;
+    currentWaypointIdx = 0;
+    waitingDwell = false;
+    sequenceRunning = true;
+
+    setTargetAnglesSync(waypoints[0].joints, waypoints[0].moveTimeSec, true);
+    Serial.printf("[WAYPOINT] Bat dau chuoi quy dao (%d diem, loop=%s)\n",
+                  waypointCount, loop ? "true" : "false");
+}
+
+void MultiAxisManager::pauseSequence() {
+    sequenceRunning = false;
+}
+
+void MultiAxisManager::stopSequence() {
+    sequenceRunning = false;
+    currentWaypointIdx = -1;
+    emergencyStopAll();
 }
 
 bool MultiAxisManager::isAnyRunning() {

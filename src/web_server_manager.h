@@ -6,6 +6,7 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include "config.h"
 #include "multi_axis_manager.h"
 #include "sensor.h"
 #include "web_ui.h"
@@ -16,11 +17,13 @@ private:
     Sensor* sensor;
     WebServer server;
     Preferences prefs;
+    unsigned long bootTimeMs;
 
     void setupRoutes();
-    void handleStatus();
+    bool parseAxis(uint8_t& outAxis);
 
-    // Single-Motor Endpoints
+    // API Handlers
+    void handleStatus();
     void handleMotorGoto();
     void handleMotorJog();
     void handleMotorStep();
@@ -28,25 +31,35 @@ private:
     void handleMotorStop();
     void handleMotorEnable();
     void handleMotorHome();
+    void handleMotorZero();
     void handleMotorCalib();
     void handleMotorCalibClear();
     void handleMotorSettings();
 
-    // Multi-Axis Endpoints
     void handleAllGoto();
     void handleAllStop();
+    void handleAllHome();
+    void handleAllZero();
+    void handleAllEnable();
 
-    // Wi-Fi Endpoints
+    void handleIKGoto();
+    void handleIKPose();
+
+    void handleWaypointList();
+    void handleWaypointAdd();
+    void handleWaypointClear();
+    void handleWaypointStart();
+    void handleWaypointPause();
+    void handleWaypointStop();
+
     void handleWifiScan();
     void handleWifiSave();
     void handleWifiClear();
-
-    uint8_t parseAxis();
+    void handleSystemReboot();
 
 public:
     WebServerManager(MultiAxisManager* mam, Sensor* s);
-
-    void begin(const char* apSsid = "NEMA-STEPPER-CONTROLLER", const char* apPass = "12345678");
+    void begin(const char* apSsid = DEFAULT_AP_SSID, const char* apPass = DEFAULT_AP_PASS);
     void handle();
 };
 

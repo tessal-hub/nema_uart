@@ -10,11 +10,13 @@ MotionController::MotionController(uint8_t axisIndex, Motor* m, Sensor* s)
       deadbandExit(DEFAULT_DEADBAND_EXIT),
       inDeadband(false),
       baseIntervalUs(DEFAULT_STEP_INTERVAL_US),
+      syncIntervalUs(DEFAULT_STEP_INTERVAL_US),
+      isSynchronizedMove(false),
       positioningActive(false), closedLoopHold(false),
       dirInvert(false), reachedTarget(false),
-      runawayDetected(false), lastObservedError(0.0f), activeMoveStartMs(0),
+      runawayDetected(false), prevCycleError(0.0f), errorIncreasingStreak(0), lastTrendCheckMs(0),
       isHomed(false), zeroOffsetAngle(0.0f),
-      totalStrokeDeg(0.0f), limitLeftDeg(0.0f), limitRightDeg(0.0f),
+      totalStrokeDeg(360.0f), limitLeftDeg(-180.0f), limitRightDeg(180.0f),
       normalCurrentMa(DEFAULT_NORMAL_CURRENT), homingCurrentMa(DEFAULT_HOMING_CURRENT),
       pendingTask(TASK_NONE) {
     snprintf(nvsNamespace, sizeof(nvsNamespace), "mctrl_%u", axisId);
@@ -136,6 +138,11 @@ void MotionController::saveSettings() {
     prefs.putUShort("curr", normalCurrentMa);
     prefs.putFloat("db_in", deadbandEnter);
     prefs.putFloat("db_out", deadbandExit);
+    prefs.putBool("homed", isHomed);
+    prefs.putFloat("z_off", zeroOffsetAngle);
+    prefs.putFloat("lim_l", limitLeftDeg);
+    prefs.putFloat("lim_r", limitRightDeg);
+    prefs.putFloat("stroke", totalStrokeDeg);
     prefs.end();
 }
 
@@ -148,9 +155,23 @@ void MotionController::loadSettings() {
     if (prefs.isKey("curr")) normalCurrentMa = prefs.getUShort("curr", DEFAULT_NORMAL_CURRENT);
     if (prefs.isKey("db_in")) deadbandEnter = prefs.getFloat("db_in", DEFAULT_DEADBAND_ENTER);
     if (prefs.isKey("db_out")) deadbandExit = prefs.getFloat("db_out", DEFAULT_DEADBAND_EXIT);
+    if (prefs.isKey("homed")) isHomed = prefs.getBool("homed", false);
+    if (prefs.isKey("z_off")) zeroOffsetAngle = prefs.getFloat("z_off", 0.0f);
+    if (prefs.isKey("lim_l")) limitLeftDeg = prefs.getFloat("lim_l", -180.0f);
+    if (prefs.isKey("lim_r")) limitRightDeg = prefs.getFloat("lim_r", 180.0f);
+    if (prefs.isKey("stroke")) totalStrokeDeg = prefs.getFloat("stroke", 360.0f);
     prefs.end();
 
     updateStepsPerDegree();
+}
+
+void MotionController::setLimits(float minDeg, float maxDeg) {
+    if (maxDeg > minDeg) {
+        limitLeftDeg = minDeg;
+        limitRightDeg = maxDeg;
+        totalStrokeDeg = maxDeg - minDeg;
+        saveSettings();
+    }
 }
 
 void MotionController::setDeadband(float enterDeg, float exitDeg) {
@@ -161,6 +182,15 @@ void MotionController::setDeadband(float enterDeg, float exitDeg) {
     }
 }
 
+void MotionController::setHomeHere() {
+    zeroOffsetAngle = getCorrectedAngle();
+    isHomed = true;
+    targetAngle = 0.0f;
+    currentAngle = 0.0f;
+    saveSettings();
+    Serial.printf(">> [ZERO J%u] Dat mốc Home 0.00 deg tai goc thuc: %.2f deg\n", axisId + 1, zeroOffsetAngle);
+}
+
 void MotionController::runAutoCalibration() {
     Serial.printf("\n[CALIB J%u] BAT DAU QUA TRINH AUTO CALIBRATION (16 DIEM)...\n", axisId + 1);
 
@@ -168,6 +198,7 @@ void MotionController::runAutoCalibration() {
     closedLoopHold = false;
     inDeadband = false;
     runawayDetected = false;
+    isSynchronizedMove = false;
     motor->stop();
     calibData.isCalibrated = false;
     delay(300);
@@ -269,12 +300,13 @@ bool MotionController::seekEndstopSmooth(bool dir, uint32_t maxSteps, float &hit
 }
 
 void MotionController::runCenterHoming(bool isDebug) {
-    Serial.printf("\n[HOMING J%u] BAT DAU HOMING TRUNG DIEM...\n", axisId + 1);
+    Serial.printf("\n[HOMING J%u] BAT DAU HOMING TRUNG DIEM CUNG LON...\n", axisId + 1);
 
     positioningActive = false;
     closedLoopHold = false;
     inDeadband = false;
     runawayDetected = false;
+    isSynchronizedMove = false;
     motor->stop();
     delay(200);
 
@@ -354,25 +386,48 @@ void MotionController::runCenterHoming(bool isDebug) {
     currentAngle = 0.0f;
     limitLeftDeg = -halfStrokeDeg;
     limitRightDeg = +halfStrokeDeg;
+    saveSettings();
 
     Serial.printf("[HOMING J%u] HOAN TAT! Set Home tai 0.00 deg (Stroke: %.2f deg)\n", axisId + 1, totalStrokeDeg);
 }
 
 void MotionController::setTargetAngle(float target) {
     if (isHomed && totalStrokeDeg > 0.0f) {
-        float maxLimit = limitRightDeg - 1.0f;
-        float minLimit = limitLeftDeg + 1.0f;
+        float maxLimit = limitRightDeg - 0.5f;
+        float minLimit = limitLeftDeg + 0.5f;
         if (target > maxLimit) target = maxLimit;
         if (target < minLimit) target = minLimit;
     }
 
     targetAngle = target;
+    isSynchronizedMove = false;
     positioningActive = true;
     reachedTarget = false;
     inDeadband = false;
     runawayDetected = false;
-    lastObservedError = fabs(getShortestAngleError(targetAngle, getHomeRelativeAngle()));
-    activeMoveStartMs = millis();
+    errorIncreasingStreak = 0;
+    prevCycleError = fabs(getShortestAngleError(targetAngle, getHomeRelativeAngle()));
+    lastTrendCheckMs = millis();
+}
+
+void MotionController::setTargetAngleSync(float target, uint32_t intervalUs) {
+    if (isHomed && totalStrokeDeg > 0.0f) {
+        float maxLimit = limitRightDeg - 0.5f;
+        float minLimit = limitLeftDeg + 0.5f;
+        if (target > maxLimit) target = maxLimit;
+        if (target < minLimit) target = minLimit;
+    }
+
+    targetAngle = target;
+    syncIntervalUs = intervalUs;
+    isSynchronizedMove = true;
+    positioningActive = true;
+    reachedTarget = false;
+    inDeadband = false;
+    runawayDetected = false;
+    errorIncreasingStreak = 0;
+    prevCycleError = fabs(getShortestAngleError(targetAngle, getHomeRelativeAngle()));
+    lastTrendCheckMs = millis();
 }
 
 void MotionController::jog(float delta) {
@@ -383,6 +438,7 @@ void MotionController::stop() {
     positioningActive = false;
     closedLoopHold = false;
     inDeadband = false;
+    isSynchronizedMove = false;
     motor->stop();
 }
 
@@ -391,7 +447,8 @@ void MotionController::moveRawSteps(bool cw, uint32_t steps, uint32_t speedUs) {
     closedLoopHold = false;
     inDeadband = false;
     runawayDetected = false;
-    if (speedUs >= 100 && speedUs <= 5000) {
+    isSynchronizedMove = false;
+    if (speedUs >= MIN_STEP_INTERVAL_US && speedUs <= MAX_STEP_INTERVAL_US) {
         motor->setSpeed(speedUs);
     } else {
         motor->setSpeed(baseIntervalUs);
@@ -406,14 +463,15 @@ void MotionController::runContinuous(bool cw, uint32_t speedUs) {
     closedLoopHold = false;
     inDeadband = false;
     runawayDetected = false;
-    if (speedUs >= 100 && speedUs <= 5000) {
+    isSynchronizedMove = false;
+    if (speedUs >= MIN_STEP_INTERVAL_US && speedUs <= MAX_STEP_INTERVAL_US) {
         motor->setSpeed(speedUs);
     } else {
         motor->setSpeed(baseIntervalUs);
     }
     bool dir = cw;
     if (dirInvert) dir = !dir;
-    motor->run(dir, 0xFFFFFFFF);
+    motor->runContinuous(dir);
 }
 
 void MotionController::setDriverEnabled(bool enabled) {
@@ -424,7 +482,7 @@ void MotionController::setDriverEnabled(bool enabled) {
 }
 
 void MotionController::setSpeed(uint32_t speedUs) {
-    if (speedUs >= 100 && speedUs <= 2000) {
+    if (speedUs >= MIN_STEP_INTERVAL_US && speedUs <= MAX_STEP_INTERVAL_US) {
         baseIntervalUs = speedUs;
         motor->setSpeed(baseIntervalUs);
         saveSettings();
@@ -451,16 +509,19 @@ void MotionController::update() {
     // 1. Sinh xung bước non-blocking
     motor->update();
 
-    // 2. Thực thi các tác vụ homing / calib bất đồng bộ
+    // 2. Thực thi các tác vụ bất đồng bộ
     if (pendingTask == TASK_HOME) {
         pendingTask = TASK_NONE;
         runCenterHoming();
     } else if (pendingTask == TASK_CALIB) {
         pendingTask = TASK_NONE;
         runAutoCalibration();
+    } else if (pendingTask == TASK_ZERO) {
+        pendingTask = TASK_NONE;
+        setHomeHere();
     }
 
-    // 3. Vòng điều khiển vị trí bám góc (Closed-loop với Schmitt-Trigger Deadband & Runaway Protection)
+    // 3. Vòng điều khiển vị trí bám góc
     if (!positioningActive && !closedLoopHold) return;
 
     currentAngle = getHomeRelativeAngle();
@@ -474,17 +535,26 @@ void MotionController::update() {
     float err = getShortestAngleError(targetAngle, currentAngle);
     float absErr = fabs(err);
 
-    // Runaway Protection: Kiểm tra nếu động cơ quay làm sai số TĂNG LÊN thay vì giảm đi (Ngược chiều Invert)
-    if (motor->isRunning() && (millis() - activeMoveStartMs > 300)) {
-        if (absErr > (lastObservedError + RUNAWAY_ERROR_THRESHOLD)) {
-            motor->stop();
-            positioningActive = false;
-            closedLoopHold = false;
-            runawayDetected = true;
-            Serial.printf(">> [CANH BAO NGUOC CHIEU J%u] Sai so tang tu %.1f do -> %.1f do! Da dung an toan. Vui long bat Invert (dao chieu)!\n",
-                          axisId + 1, lastObservedError, absErr);
-            return;
+    // Runaway Protection: Kiểm tra đạo hàm xu hướng sai số theo thời gian (Sliding Derivative Trend)
+    uint32_t now = millis();
+    if (motor->isRunning() && (now - lastTrendCheckMs >= 50)) {
+        lastTrendCheckMs = now;
+        if (absErr > (prevCycleError + 0.25f)) {
+            errorIncreasingStreak++;
+            if (errorIncreasingStreak >= 4) { // Sai số tăng liên tục trong >200ms
+                motor->stop();
+                positioningActive = false;
+                closedLoopHold = false;
+                isSynchronizedMove = false;
+                runawayDetected = true;
+                Serial.printf(">> [CANH BAO NGUOC CHIEU J%u] Sai so lien tuc tang tu %.2f do -> %.2f do! Da dung an toan. Vui long bat Invert!\n",
+                              axisId + 1, prevCycleError, absErr);
+                return;
+            }
+        } else if (absErr < prevCycleError - 0.1f) {
+            errorIncreasingStreak = 0;
         }
+        prevCycleError = absErr;
     }
 
     // Schmitt-Trigger Deadband Logic
@@ -492,8 +562,9 @@ void MotionController::update() {
         if (absErr > deadbandExit) {
             inDeadband = false;
             reachedTarget = false;
-            lastObservedError = absErr;
-            activeMoveStartMs = millis();
+            prevCycleError = absErr;
+            errorIncreasingStreak = 0;
+            lastTrendCheckMs = millis();
         } else {
             return;
         }
@@ -505,6 +576,7 @@ void MotionController::update() {
         }
         reachedTarget = true;
         inDeadband = true;
+        isSynchronizedMove = false;
 
         if (!closedLoopHold) {
             positioningActive = false;
@@ -522,14 +594,23 @@ void MotionController::update() {
         if (neededSteps == 0) neededSteps = 1;
 
         uint32_t interval = baseIntervalUs;
-        if (absErr < 3.0f) {
-            interval = baseIntervalUs * 2;
-        } else if (absErr < 10.0f) {
-            interval = (uint32_t)(baseIntervalUs * 1.4f);
+
+        // Nếu đang trong chu kỳ quay đồng bộ đa trục, KHÔNG làm chậm cục bộ để giữ đúng tỷ lệ T_sync
+        if (isSynchronizedMove) {
+            interval = syncIntervalUs;
+        } else {
+            // Adaptive speed scaling cho lệnh đơn trục thông thường
+            if (absErr < 2.0f) {
+                interval = baseIntervalUs * 2;
+            } else if (absErr < 8.0f) {
+                interval = (uint32_t)(baseIntervalUs * 1.4f);
+            }
         }
+
         motor->setSpeed(interval);
-        lastObservedError = absErr;
-        activeMoveStartMs = millis();
+        prevCycleError = absErr;
+        errorIncreasingStreak = 0;
+        lastTrendCheckMs = millis();
         motor->run(dir, neededSteps);
     }
 }

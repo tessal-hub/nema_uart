@@ -15,7 +15,12 @@ struct CalibData {
     bool isCalibrated;
 };
 
-enum ControllerTask { TASK_NONE, TASK_HOME, TASK_CALIB };
+enum ControllerTask {
+    TASK_NONE,
+    TASK_HOME,
+    TASK_CALIB,
+    TASK_ZERO
+};
 
 class MotionController {
 private:
@@ -40,14 +45,19 @@ private:
     bool inDeadband;
 
     uint32_t baseIntervalUs;
+    uint32_t syncIntervalUs;
+    bool isSynchronizedMove;
 
     bool positioningActive;
     bool closedLoopHold;
     bool dirInvert;
     bool reachedTarget;
+
+    // Runaway Trend Detection (Phát hiện ngược chiều theo đạo hàm xu hướng sai số)
     bool runawayDetected;
-    float lastObservedError;
-    uint32_t activeMoveStartMs;
+    float prevCycleError;
+    uint8_t errorIncreasingStreak;
+    uint32_t lastTrendCheckMs;
 
     bool isHomed;
     float zeroOffsetAngle;
@@ -83,7 +93,9 @@ public:
 
     // Homing & Positioning
     void runCenterHoming(bool isDebug = false);
+    void setHomeHere();                   // Đặt vị trí hiện tại làm mốc 0.00 deg
     void setTargetAngle(float target);
+    void setTargetAngleSync(float target, uint32_t intervalUs); // Đồng bộ đa trục không bị adaptive override
     void jog(float delta);
     void stop();
 
@@ -95,6 +107,7 @@ public:
     // Async task triggering from Web / Serial
     void triggerHome() { pendingTask = TASK_HOME; }
     void triggerCalib() { pendingTask = TASK_CALIB; }
+    void triggerZero() { pendingTask = TASK_ZERO; }
 
     // Angle queries
     float getCorrectedAngle();
@@ -128,11 +141,12 @@ public:
     void setSpeed(uint32_t speedUs);
     void setCurrent(uint16_t ma);
     void setGearRatio(float ratio);
+    void setLimits(float minDeg, float maxDeg);
     void setClosedLoopHold(bool hold) { closedLoopHold = hold; saveSettings(); }
     void setDirInvert(bool invert) { dirInvert = invert; runawayDetected = false; saveSettings(); }
     void setTolerance(float tol) { if (tol >= 0.05f && tol <= 10.0f) angleTolerance = tol; }
     void setDeadband(float enterDeg, float exitDeg);
-    void resetRunaway() { runawayDetected = false; }
+    void resetRunaway() { runawayDetected = false; errorIncreasingStreak = 0; }
 };
 
 #endif // MOTION_CONTROLLER_H
