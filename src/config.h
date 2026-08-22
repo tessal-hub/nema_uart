@@ -34,8 +34,8 @@
 #define AS5600_ADDR       0x36       // AS5600 I2C address
 #define RAW_ANGLE_REG     0x0E
 
-// Sensor Task configuration (Core 0, 500Hz)
-#define SENSOR_TASK_PERIOD_MS        2
+// Sensor Task configuration (Core 0, 200Hz)
+#define SENSOR_TASK_PERIOD_MS        5     // 200Hz — đủ oversample 2x so với control loop 100Hz
 #define SENSOR_TASK_STACK_SIZE       4096
 #define SENSOR_TASK_PRIORITY         2
 #define SENSOR_TASK_CORE             0
@@ -48,7 +48,7 @@
 // ==============================================================================
 // 3. TMC2209 STEPPER DRIVERS (DUAL HARDWARE UART & STEP/DIR PINS)
 // ==============================================================================
-#define R_SENSE           0.11f      // Current sense resistor (Ohms)
+#define R_SENSE           0.10f      // Current sense resistor (Ohms) — xác nhận cho Tenstar V985
 #define TMC_UART_BAUD     115200     // Hardware UART Baud Rate
 
 // UART Bus 1: Drives Motors 0, 1, 2, 3 (Addresses 0b00, 0b01, 0b10, 0b11)
@@ -105,12 +105,48 @@ static const float DEFAULT_AXIS_GEAR_RATIOS[NUM_MOTORS] = {
 #define DEFAULT_MICROSTEPS        16       // 1/16 microstepping
 #define DEFAULT_NORMAL_CURRENT    800      // Normal running current (mA)
 #define DEFAULT_HOMING_CURRENT    750      // High-torque current for homing through gearbox friction (mA)
-#define DEFAULT_HOLD_SCALE        8        // TMC2209 ihold scale (0..31)
+
+// Dòng điện Homing mặc định theo từng khớp (J2/J3 nâng cánh tay cần lực lớn hơn để không dừng giữa chừng)
+#define HOMING_CURRENT_J1         950      // Base Yaw - mô-men xoắn cao xoay toàn bộ thân robot (mA)
+#define HOMING_CURRENT_J2         1600     // Shoulder Pitch - dòng cực đại vượt trọng lực cánh tay (mA)
+#define HOMING_CURRENT_J3         1600     // Elbow Pitch - dòng cực đại nâng cẳng tay & cụm cổ tay (mA)
+#define HOMING_CURRENT_J4         850      // Wrist Roll (mA)
+#define HOMING_CURRENT_J5         800      // Wrist Pitch (mA)
+#define HOMING_CURRENT_J6         800      // Flange Roll (mA)
+
+static const uint16_t DEFAULT_AXIS_HOMING_CURRENTS[NUM_MOTORS] = {
+    HOMING_CURRENT_J1,
+    HOMING_CURRENT_J2,
+    HOMING_CURRENT_J3,
+    HOMING_CURRENT_J4,
+    HOMING_CURRENT_J5,
+    HOMING_CURRENT_J6
+};
+
+// Vận tốc phát xung Homing tối ưu riêng cho từng trục (Trục tải nặng leo dốc J2/J3 chạy 2500us để đạt mô-men xoắn cực đại)
+#define HOMING_STEP_INTERVAL_J1   1600     // Base Yaw (625 steps/sec)
+#define HOMING_STEP_INTERVAL_J2   2500     // Shoulder Pitch (400 steps/sec - mô-men xoắn cực đại vượt dốc trọng lực)
+#define HOMING_STEP_INTERVAL_J3   2500     // Elbow Pitch (400 steps/sec - mô-men xoắn cực đại nâng cụm cổ tay)
+#define HOMING_STEP_INTERVAL_J4   1600     // Wrist Roll (625 steps/sec)
+#define HOMING_STEP_INTERVAL_J5   1600     // Wrist Pitch (625 steps/sec)
+#define HOMING_STEP_INTERVAL_J6   1600     // Flange Roll (625 steps/sec)
+
+static const uint32_t DEFAULT_AXIS_HOMING_SPEEDS[NUM_MOTORS] = {
+    HOMING_STEP_INTERVAL_J1,
+    HOMING_STEP_INTERVAL_J2,
+    HOMING_STEP_INTERVAL_J3,
+    HOMING_STEP_INTERVAL_J4,
+    HOMING_STEP_INTERVAL_J5,
+    HOMING_STEP_INTERVAL_J6
+};
+
+#define DEFAULT_HOLD_SCALE        20       // TMC2209 ihold scale 20/31 (~65% dòng giữ) chống sụt cánh tay do trọng lực
 #define DEFAULT_STALL_THRESHOLD   60       // TMC2209 StallGuard4 sensitivity threshold (0..255)
 
 // Speed & Acceleration Timing (in microseconds per step pulse)
 #define DEFAULT_STEP_INTERVAL_US  400      // Target step interval (us) -> 2500 steps/sec
-#define HOMING_STEP_INTERVAL_US   1600     // Safe, high-torque crawl speed for homing (us) -> 625 steps/sec
+#define HOMING_STEP_INTERVAL_US   1600     // Vận tốc dò cữ mặc định chung
+#define HOMING_MAX_DURATION_MS    90000    // Giới hạn thời gian 90s (đủ cho 180°+ ở tốc độ chậm)
 #define MIN_STEP_INTERVAL_US      120      // Max speed limit (us) -> ~8333 steps/sec
 #define MAX_STEP_INTERVAL_US      2500     // Starting / Creep speed interval (us)
 #define DEFAULT_ACCEL_RATE        12       // Microseconds interval delta per acceleration step

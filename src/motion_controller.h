@@ -75,7 +75,7 @@ private:
     void updateStepsPerDegree();
     float normalizeAngle(float a);
     float getShortestAngleError(float target, float current);
-    bool seekEndstopSmooth(bool dir, uint32_t maxSteps, float &hitAngle, bool isDebug = false);
+    bool seekEndstopSmooth(bool dir, uint32_t maxSteps, float &hitAngle, float &netTravel, bool isDebug = false);
 
 public:
     MotionController(uint8_t axisIndex, Motor* m, Sensor* s);
@@ -84,7 +84,7 @@ public:
     void update();
 
     // Auto Direction & Polarity Detection (Tự động phát hiện hộp số đảo / nam châm ngược)
-    bool detectAndAutoSetDirection(bool returnToStart = true);
+    bool detectAndAutoSetDirection(bool returnToStart = true, bool useHomingCurrent = false);
 
     // Calibration
     void runAutoCalibration();
@@ -103,6 +103,7 @@ public:
     void setTargetAngleSync(float target, uint32_t intervalUs); // Đồng bộ đa trục không bị adaptive override
     void jog(float delta);
     void stop();
+    void forceStopState(); // Dừng cờ trạng thái an toàn KHÔNG cần mutex, dùng cho E-Stop fallback
 
     // Raw / Simple Motor Control
     void moveRawSteps(bool cw, uint32_t steps, uint32_t speedUs = 0);

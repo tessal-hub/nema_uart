@@ -1,6 +1,40 @@
 #include "web_server_manager.h"
 #include <StreamString.h>
 
+// Global thread-safe log buffer for Web Console streaming
+static const uint8_t LOG_BUFFER_SIZE = 35;
+static String logRingBuffer[LOG_BUFFER_SIZE];
+static uint32_t globalLogSeq = 0;
+static SemaphoreHandle_t logBufferMutex = nullptr;
+
+void sysLog(const String& msg) {
+    Serial.println(msg);
+    if (logBufferMutex == nullptr) {
+        logBufferMutex = xSemaphoreCreateMutex();
+    }
+    if (logBufferMutex != nullptr && xSemaphoreTake(logBufferMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        logRingBuffer[globalLogSeq % LOG_BUFFER_SIZE] = msg;
+        globalLogSeq++;
+        xSemaphoreGive(logBufferMutex);
+    }
+}
+
+void sysLogf(const char* format, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+
+    String s = String(buf);
+    s.trim();
+    if (s.length() > 0) {
+        sysLog(s);
+    } else {
+        Serial.print(buf);
+    }
+}
+
 WebServerManager::WebServerManager(MultiAxisManager* mam, Sensor* s)
     : axisManager(mam), sensor(s), server(WEB_SERVER_PORT), bootTimeMs(millis()) {}
 
@@ -94,6 +128,7 @@ void WebServerManager::setupRoutes() {
     server.on("/api/motor/calib_clear", HTTP_POST, [this]() { handleMotorCalibClear(); });
     server.on("/api/motor/autodir", HTTP_POST, [this]() { handleMotorAutoDir(); });
     server.on("/api/motor/settings", HTTP_POST, [this]() { handleMotorSettings(); });
+    server.on("/api/motor/maxvel", HTTP_POST, [this]() { handleMotorMaxVel(); });
 
     // Multi-Axis routes
     server.on("/api/all/goto", HTTP_POST, [this]() { handleAllGoto(); });
@@ -242,6 +277,21 @@ void WebServerManager::handleStatus() {
         json += "}";
     }
 
+    json += "],\"log_seq\":" + String(globalLogSeq) + ",\"logs\":[";
+    if (logBufferMutex != nullptr && xSemaphoreTake(logBufferMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        uint32_t count = (globalLogSeq < LOG_BUFFER_SIZE) ? globalLogSeq : LOG_BUFFER_SIZE;
+        uint32_t startIdx = (globalLogSeq > count) ? (globalLogSeq - count) : 0;
+        for (uint32_t k = 0; k < count; k++) {
+            if (k > 0) json += ",";
+            String l = logRingBuffer[(startIdx + k) % LOG_BUFFER_SIZE];
+            l.replace("\\", "\\\\");
+            l.replace("\"", "\\\"");
+            l.replace("\n", " ");
+            l.replace("\r", "");
+            json += "\"" + l + "\"";
+        }
+        xSemaphoreGive(logBufferMutex);
+    }
     json += "]}";
     sendJson(200, json);
 }
@@ -450,6 +500,21 @@ void WebServerManager::handleMotorSettings() {
         }
     }
     sendJson(200, "{\"status\":\"SETTINGS_SAVED\"}");
+}
+
+void WebServerManager::handleMotorMaxVel() {
+    uint8_t axis = 0;
+    if (!parseAxis(axis)) {
+        sendJsonError(400, "Missing or invalid axis (0..5)");
+        return;
+    }
+    if (!server.hasArg("deg_per_sec")) {
+        sendJsonError(400, "Missing deg_per_sec parameter");
+        return;
+    }
+    float degPerSec = server.arg("deg_per_sec").toFloat();
+    axisManager->setMaxVelocity(axis, degPerSec);
+    sendJson(200, "{\"status\":\"MAXVEL_SAVED\",\"axis\":" + String(axis) + ",\"max_vel\":" + String(axisManager->getMaxVelocity(axis), 2) + "}");
 }
 
 void WebServerManager::handleAllGoto() {

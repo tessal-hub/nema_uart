@@ -989,6 +989,19 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     }
 
     function renderTelemetry(d) {
+        // Stream live Serial logs to Web Console
+        if (d.logs && d.log_seq !== undefined) {
+            if (window._lastLogSeq === undefined) {
+                window._lastLogSeq = d.log_seq;
+                d.logs.forEach(l => logConsole(l));
+            } else if (d.log_seq > window._lastLogSeq) {
+                const newCount = Math.min(d.log_seq - window._lastLogSeq, d.logs.length);
+                const newItems = d.logs.slice(d.logs.length - newCount);
+                newItems.forEach(l => logConsole(l));
+                window._lastLogSeq = d.log_seq;
+            }
+        }
+
         // System state badge
         const stateBadge = document.getElementById('badge-sys-state');
         if (d.any_running) {

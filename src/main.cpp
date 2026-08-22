@@ -464,6 +464,11 @@ String handleSerialCommand(String cmd) {
             controllerList[axis]->setGearRatio(gr);
             Serial.printf(">> [SERIAL M%d] Da cai dat Gear Ratio = %.2f : 1\n", axis + 1, gr);
             return "M" + String(axis + 1) + " gear ratio set";
+        } else if (sub.startsWith("MAXVEL ") || sub.startsWith("maxvel ")) {
+            float mv = sub.substring(7).toFloat();
+            axisManager.setMaxVelocity(axis, mv);
+            Serial.printf(">> [SERIAL M%d] Da cai dat Max Velocity = %.2f deg/s\n", axis + 1, axisManager.getMaxVelocity(axis));
+            return "M" + String(axis + 1) + " max velocity set to " + String(axisManager.getMaxVelocity(axis), 2) + " deg/s";
         } else if (sub.startsWith("STEP ") || sub.startsWith("step ")) {
             String stepArgs = sub.substring(5);
             stepArgs.trim();

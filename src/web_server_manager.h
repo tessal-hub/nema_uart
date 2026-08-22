@@ -12,6 +12,10 @@
 #include "sensor.h"
 #include "web_ui.h"
 
+// Thread-safe log buffer for Web Console & Serial streaming
+void sysLog(const String& msg);
+void sysLogf(const char* format, ...);
+
 class WebServerManager {
 private:
     MultiAxisManager* axisManager;
@@ -40,6 +44,7 @@ private:
     void handleMotorCalibClear();
     void handleMotorAutoDir();
     void handleMotorSettings();
+    void handleMotorMaxVel();
 
     void handleAllGoto();
     void handleAllStop();

@@ -56,6 +56,8 @@ public:
     void triggerJointCalib(uint8_t axis);
     void triggerJointAutoDir(uint8_t axis);
     void stopJoint(uint8_t axis);
+    void setMaxVelocity(uint8_t axis, float degPerSec);
+    float getMaxVelocity(uint8_t axis) const;
 
     // --- Multi-Axis Coordinated Controls ---
     void setTargetAnglesSync(const float targets[NUM_MOTORS], float moveTimeSec = 0.0f, bool syncArrival = true);

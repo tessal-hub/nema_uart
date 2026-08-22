@@ -205,6 +205,15 @@ void MultiAxisManager::stopJoint(uint8_t axis) {
     }
 }
 
+void MultiAxisManager::setMaxVelocity(uint8_t axis, float degPerSec) {
+    if (axis >= NUM_MOTORS || degPerSec <= 1.0f) return;
+    maxVelocityDegPerSec[axis] = degPerSec;
+}
+
+float MultiAxisManager::getMaxVelocity(uint8_t axis) const {
+    return (axis < NUM_MOTORS) ? maxVelocityDegPerSec[axis] : 180.0f;
+}
+
 void MultiAxisManager::setTargetAnglesSync(const float targets[NUM_MOTORS], float moveTimeSec, bool syncArrival) {
     if (stateMutex == nullptr || xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
 
@@ -310,9 +319,12 @@ void MultiAxisManager::emergencyStopAll() {
         }
         xSemaphoreGive(stateMutex);
     } else {
-        // Fallback trực tiếp nếu mutex bị khóa
+        // Fallback trực tiếp nếu mutex bị khóa — PHẢI reset cả state controller,
+        // không chỉ dừng motor vật lý, nếu không update() sẽ tự chạy lại lệnh cũ
         for (uint8_t i = 0; i < NUM_MOTORS; i++) {
-            if (motors[i] != nullptr) {
+            if (controllers[i] != nullptr) {
+                controllers[i]->forceStopState();
+            } else if (motors[i] != nullptr) {
                 motors[i]->stop();
             }
         }

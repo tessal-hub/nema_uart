@@ -1,4 +1,5 @@
 #include "motion_controller.h"
+#include "web_server_manager.h"
 #include <esp_task_wdt.h>
 
 MotionController::MotionController(uint8_t axisIndex, Motor* m, Sensor* s)
@@ -18,7 +19,8 @@ MotionController::MotionController(uint8_t axisIndex, Motor* m, Sensor* s)
       runawayDetected(false), prevCycleError(0.0f), errorIncreasingStreak(0), lastTrendCheckMs(0),
       isHomed(false), zeroOffsetAngle(0.0f),
       totalStrokeDeg(360.0f), limitLeftDeg(-180.0f), limitRightDeg(180.0f),
-      normalCurrentMa(DEFAULT_NORMAL_CURRENT), homingCurrentMa(DEFAULT_HOMING_CURRENT),
+      normalCurrentMa(DEFAULT_NORMAL_CURRENT),
+      homingCurrentMa((axisIndex < NUM_MOTORS) ? DEFAULT_AXIS_HOMING_CURRENTS[axisIndex] : DEFAULT_HOMING_CURRENT),
       stallThreshold(DEFAULT_STALL_THRESHOLD),
       pendingTask(TASK_NONE) {
     snprintf(nvsNamespace, sizeof(nvsNamespace), "mctrl_%u", axisId);
@@ -163,7 +165,16 @@ void MotionController::loadSettings() {
     if (prefs.isKey("hold")) closedLoopHold = prefs.getBool("hold", false);
     if (prefs.isKey("speed")) baseIntervalUs = prefs.getUInt("speed", DEFAULT_STEP_INTERVAL_US);
     if (prefs.isKey("curr")) normalCurrentMa = prefs.getUShort("curr", DEFAULT_NORMAL_CURRENT);
-    if (prefs.isKey("h_curr")) homingCurrentMa = prefs.getUShort("h_curr", DEFAULT_HOMING_CURRENT);
+    uint16_t defHomingCurr = (axisId < NUM_MOTORS) ? DEFAULT_AXIS_HOMING_CURRENTS[axisId] : DEFAULT_HOMING_CURRENT;
+    if (prefs.isKey("h_curr")) {
+        homingCurrentMa = prefs.getUShort("h_curr", defHomingCurr);
+    } else {
+        homingCurrentMa = defHomingCurr;
+    }
+    // Cập nhật lên mức mặc định mới cho J2/J3 nếu đang bị kẹt ở mức quá thấp cũ (< 900mA)
+    if (homingCurrentMa < defHomingCurr) {
+        homingCurrentMa = defHomingCurr;
+    }
     if (prefs.isKey("sg_th")) stallThreshold = prefs.getUChar("sg_th", DEFAULT_STALL_THRESHOLD);
     if (prefs.isKey("db_in")) deadbandEnter = prefs.getFloat("db_in", DEFAULT_DEADBAND_ENTER);
     if (prefs.isKey("db_out")) deadbandExit = prefs.getFloat("db_out", DEFAULT_DEADBAND_EXIT);
@@ -216,8 +227,8 @@ void MotionController::setHomeHere() {
     Serial.printf(">> [ZERO J%u] Dat mốc Home 0.00 deg tai goc thuc: %.2f deg\n", axisId + 1, zeroOffsetAngle);
 }
 
-bool MotionController::detectAndAutoSetDirection(bool returnToStart) {
-    Serial.printf("\n[AUTO-DIR J%u] Kiem tra chieu quay dong co vs cam bien AS5600...\n", axisId + 1);
+bool MotionController::detectAndAutoSetDirection(bool returnToStart, bool useHomingCurrent) {
+    sysLogf("\n[AUTO-DIR J%u] Kiem tra chieu quay dong co vs cam bien AS5600...\n", axisId + 1);
 
     positioningActive = false;
     closedLoopHold = false;
@@ -243,7 +254,9 @@ bool MotionController::detectAndAutoSetDirection(bool returnToStart) {
     if (testSteps < 60) testSteps = 60;
     if (testSteps > 1500) testSteps = 1500;
 
-    motor->setCurrent(normalCurrentMa);
+    // Dung dong Homing (an toan hon, thap hon) neu goi tu trong quy trinh Homing,
+    // nguoc lai dung dong chay binh thuong cho lenh AUTODIR thu cong doc lap
+    motor->setCurrent(useHomingCurrent ? homingCurrentMa : normalCurrentMa);
     motor->setSpeed(HOMING_STEP_INTERVAL_US);
 
     // Buoc 1: Chay thu ve huong CW (true)
@@ -301,8 +314,9 @@ bool MotionController::detectAndAutoSetDirection(bool returnToStart) {
         }
 
         // Tra ve vi tri ban dau neu da chay 2x CCW
+        // (SUA: truoc day chi chay lai testSteps, thieu mot nua quang duong da di chuyen)
         if (returnToStart) {
-            motor->run(true, testSteps);
+            motor->run(true, testSteps * 2);
             while (motor->isRunning()) {
                 vTaskDelay(pdMS_TO_TICKS(1));
                 esp_task_wdt_reset();
@@ -313,11 +327,11 @@ bool MotionController::detectAndAutoSetDirection(bool returnToStart) {
 
     if (determined) {
         saveSettings();
-        Serial.printf(">> [AUTO-DIR J%u] HOAN TAT! Delta = %+.2f deg ==> Tu dong cai dirInvert = %s (Da luu vao Flash NVS)!\n",
-                      axisId + 1, (fabsf(deltaCW) >= 0.15f ? deltaCW : 0.0f),
-                      dirInvert ? "TRUE (DAO CHIEU)" : "FALSE (CHIEU THUAN)");
+        sysLogf(">> [AUTO-DIR J%u] HOAN TAT! Delta = %+.2f deg ==> Tu dong cai dirInvert = %s (Da luu vao Flash NVS)!\n",
+                axisId + 1, (fabsf(deltaCW) >= 0.15f ? deltaCW : 0.0f),
+                dirInvert ? "TRUE (DAO CHIEU)" : "FALSE (CHIEU THUAN)");
     } else {
-        Serial.printf(">> [AUTO-DIR J%u] CANH BAO: Khong do duoc bien thien goc ro rang (Delta < 0.15 deg).\n", axisId + 1);
+        sysLogf(">> [AUTO-DIR J%u] CANH BAO: Khong do duoc bien thien goc ro rang (Delta < 0.15 deg).\n", axisId + 1);
     }
 
     // Tra ve vi tri xuat phat neu chay don huong CW
@@ -391,64 +405,101 @@ void MotionController::runAutoCalibration() {
     vTaskDelay(pdMS_TO_TICKS(200));
 }
 
-bool MotionController::seekEndstopSmooth(bool dir, uint32_t maxSteps, float &hitAngle, bool isDebug) {
+bool MotionController::seekEndstopSmooth(bool dir, uint32_t maxSteps, float &hitAngle, float &netTravel, bool isDebug) {
     motor->setCurrent(homingCurrentMa);
 
     // Đảm bảo chiều di chuyển vật lý tuân thủ đúng dirInvert
     bool physicalDir = dir;
     if (dirInvert) physicalDir = !physicalDir;
 
-    // Vận tốc bò chậm mô-men xoắn cao ổn định (1600us = ~625 steps/sec)
-    motor->setSpeed(HOMING_STEP_INTERVAL_US);
+    uint32_t homingSpeedUs = (axisId < NUM_MOTORS) ? DEFAULT_AXIS_HOMING_SPEEDS[axisId] : HOMING_STEP_INTERVAL_US;
+
+    // Vận tốc bò chậm mô-men xoắn cao ổn định (2500us cho J2/J3 để sinh lực nâng cực đại)
+    motor->setSpeed(homingSpeedUs);
     motor->run(physicalDir, maxSteps);
 
     bool stallDetected = false;
     unsigned long startTime = millis();
-    unsigned long lastCheckMs = millis();
+    unsigned long lastLogMs = millis();
 
-    float lastAngle = getCorrectedAngle();
-    uint8_t stationaryStreak = 0;
+    // ===== THUẬT TOÁN CỬA SỔ TRƯỢT 1.25 GIÂY (DIRECTION-AGNOSTIC SLIDING WINDOW) =====
+    const int HISTORY_SAMPLES = 25; // 25 mẫu × 50ms = 1250ms (1.25 giây)
+    float unrolledHistory[HISTORY_SAMPLES];
+    int histIdx = 0;
+    bool histFull = false;
 
-    // Tự động tính ngưỡng dừng cữ theo tỉ số truyền của từng khớp:
-    // Ở 1600us/step, mỗi 100ms phát ra ~62.5 bước.
-    // Góc di chuyển lý thuyết của khớp trong 100ms:
-    float expectedDegIn100ms = (stepsPerDegree > 0.1f) ? (62.5f / stepsPerDegree) : 1.0f;
-    float stallThresholdDeg = expectedDegIn100ms * 0.35f;
-    if (stallThresholdDeg > 0.08f) stallThresholdDeg = 0.08f;
-    if (stallThresholdDeg < 0.02f) stallThresholdDeg = 0.02f;
+    float startRawAngle = getCorrectedAngle();
+    float lastRawAngle = startRawAngle;
+    float unrolledAngle = 0.0f;
+    float peakMovedAngle = startRawAngle;
+    float maxTravelSoFar = 0.0f;
+
+    const float MIN_TRAVEL_IN_1200MS = 0.35f; // Cần di chuyển ít nhất 0.35° trong 1.25 giây
 
     while (motor->isRunning()) {
         unsigned long now = millis();
 
-        // Chờ 450ms cho động cơ vào dải vận tốc hành trình ổn định
-        if (now - startTime > 450) {
-            if (now - lastCheckMs >= 100) {
-                lastCheckMs = now;
-                float currentDeg = getCorrectedAngle();
-                float deltaAngle = fabsf(getShortestAngleError(currentDeg, lastAngle));
+        // 1. Giới hạn thời gian tuyệt đối bảo vệ an toàn
+        if (now - startTime > HOMING_MAX_DURATION_MS) {
+            motor->stop();
+            if (isDebug) {
+                sysLogf(">> [TIMEOUT J%u] Homing vuot qua %u ms! Dung an toan.\n",
+                        axisId + 1, (unsigned)HOMING_MAX_DURATION_MS);
+            }
+            break;
+        }
 
-                // Khi chạy tự do, deltaAngle >> stallThresholdDeg.
-                // Khi chạm cữ cứng, rotor bị giữ chặt -> deltaAngle < stallThresholdDeg.
-                if (deltaAngle < stallThresholdDeg) {
-                    stationaryStreak++;
-                    // Yêu cầu 3 chu kỳ liên tiếp (300ms đứng yên thực tế) để xác nhận chạm cữ
-                    if (stationaryStreak >= 3) {
-                        stallDetected = true;
-                        hitAngle = currentDeg;
-                        motor->stop();
-                        if (isDebug) {
-                            Serial.printf(">> [STALL J%u] Chạm cữ vật lý xác nhận tại góc %.2f° (Dir: %s, Thresh: %.3f°)\n",
-                                          axisId + 1, hitAngle, dir ? "CW" : "CCW", stallThresholdDeg);
-                        }
-                        break;
-                    }
-                } else {
-                    stationaryStreak = 0;
+        // 2. Đọc góc cảm biến và cập nhật unrolled angle liên tục (không bị giới hạn 0-360°)
+        float currentRaw = getCorrectedAngle();
+        float delta = getShortestAngleError(currentRaw, lastRawAngle);
+        unrolledAngle += delta;
+        lastRawAngle = currentRaw;
+
+        // Theo dõi góc đạt độ dịch chuyển xa nhất
+        if (fabsf(unrolledAngle) > maxTravelSoFar) {
+            maxTravelSoFar = fabsf(unrolledAngle);
+            peakMovedAngle = currentRaw;
+        }
+
+        // 3. Đọc mẫu cũ nhất từ 1.25s trước (trước khi ghi đè)
+        float oldestUnrolled = unrolledHistory[histIdx % HISTORY_SAMPLES];
+
+        // Lưu mẫu hiện tại vào bộ đệm vòng
+        unrolledHistory[histIdx % HISTORY_SAMPLES] = unrolledAngle;
+        histIdx++;
+        if (histIdx >= HISTORY_SAMPLES) histFull = true;
+
+        // 4. Kiểm tra độ dịch chuyển trong 1.25s sau khi bộ đệm đã đầy (sau 1.25s đầu tiên)
+        if (histFull && (now - startTime > 1200)) {
+            float distMoved1s = fabsf(unrolledAngle - oldestUnrolled);
+
+            // Log debug định kỳ mỗi 300ms
+            if (isDebug && (now - lastLogMs >= 300)) {
+                lastLogMs = now;
+                sysLogf("[J%u MOVE] raw=%.2f unrolled=%+.2f dist1.2s=%.2f° (thresh=%.2f°)\n",
+                        axisId + 1, currentRaw, unrolledAngle, distMoved1s, MIN_TRAVEL_IN_1200MS);
+            }
+
+            if (distMoved1s < MIN_TRAVEL_IN_1200MS) {
+                stallDetected = true;
+                hitAngle = peakMovedAngle; // Lấy góc tại điểm chạm cữ xa nhất
+                motor->stop();
+                if (isDebug) {
+                    sysLogf(">> [STALL J%u] CHAM CU CO KHI XAC NHAN tai goc %.2f° (dist1.2s=%.2f° < %.2f°, totalTravel=%+.2f°)\n",
+                            axisId + 1, hitAngle, distMoved1s, MIN_TRAVEL_IN_1200MS, unrolledAngle);
                 }
-                lastAngle = currentDeg;
+                break;
+            }
+        } else {
+            // Đang trong giai đoạn khởi động tích lũy dữ liệu 1.2s
+            if (isDebug && (now - lastLogMs >= 300)) {
+                lastLogMs = now;
+                sysLogf("[J%u WARMUP] raw=%.2f unrolled=%+.2f collecting %d/%d\n",
+                        axisId + 1, currentRaw, unrolledAngle, histIdx, HISTORY_SAMPLES);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+
+        vTaskDelay(pdMS_TO_TICKS(50));
         esp_task_wdt_reset();
     }
 
@@ -456,13 +507,15 @@ bool MotionController::seekEndstopSmooth(bool dir, uint32_t maxSteps, float &hit
         hitAngle = getCorrectedAngle();
     }
 
-    motor->setCurrent(normalCurrentMa);
+    netTravel = unrolledAngle;
     motor->setSpeed(baseIntervalUs);
     return stallDetected;
 }
 
 void MotionController::runCenterHoming(bool isDebug) {
-    Serial.printf("\n[HOMING J%u] BAT DAU HOMING DÒ CỮ AN TOÀN...\n", axisId + 1);
+    sysLogf("\n[HOMING J%u] BAT DAU HOMING DÒ CỮ AN TOÀN...\n", axisId + 1);
+
+    uint32_t homingSpeedUs = (axisId < NUM_MOTORS) ? DEFAULT_AXIS_HOMING_SPEEDS[axisId] : HOMING_STEP_INTERVAL_US;
 
     positioningActive = false;
     closedLoopHold = false;
@@ -470,26 +523,43 @@ void MotionController::runCenterHoming(bool isDebug) {
     runawayDetected = false;
     isSynchronizedMove = false;
     motor->stop();
+    motor->setCurrent(homingCurrentMa); // Đảm bảo dòng mô-men xoắn cao được giữ liên tục
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_task_wdt_reset();
 
-    const uint32_t MAX_STEPS = (uint32_t)(fullStepsPerRev * currentMicrosteps * fabsf(gearRatio) * 2.0f);
-    const uint32_t backoffSteps = (uint32_t)(5.0f * stepsPerDegree);
+    // ===== GIAI ĐOẠN 0.5: Dò chiều quay tự động trước khi tìm cữ =====
+    sysLogf(">> [HOMING J%u] Giai doan xac dinh chieu quay truoc khi do cu...\n", axisId + 1);
+    bool dirConfirmed = detectAndAutoSetDirection(true, true); // returnToStart=true, useHomingCurrent=true
+    if (!dirConfirmed) {
+        sysLogf(">> [HOMING J%u] CANH BAO: Khong xac dinh duoc chieu quay ro rang tu buoc do\n"
+                "   (co the dang dung sat mot gioi han co san). Tiep tuc dong homing voi\n"
+                "   cai dat Invert hien tai (%s).\n",
+                axisId + 1, dirInvert ? "DAO CHIEU" : "THUAN");
+    }
+
+    // Đảm bảo dòng Homing duy trì sau bước auto-dir
+    motor->setCurrent(homingCurrentMa);
+
+    const uint32_t MAX_STEPS = (uint32_t)(fullStepsPerRev * currentMicrosteps * fabsf(gearRatio) * 3.0f);
+    const float BACKOFF_DEG = 8.0f; // Lùi 8 độ đảm bảo tách rời hoàn toàn khỏi cữ cơ khí & quán tính
+    const uint32_t backoffSteps = (uint32_t)(BACKOFF_DEG * stepsPerDegree);
 
     // BƯỚC 1: Tìm cữ chặn bên Trái (CCW / Min)
     float angleMin = 0.0f;
-    bool foundMin = seekEndstopSmooth(false, MAX_STEPS, angleMin, true);
+    float travel1 = 0.0f;
+    bool foundMin = seekEndstopSmooth(false, MAX_STEPS, angleMin, travel1, true);
 
     if (!foundMin) {
-        Serial.printf("[LOI HOMING J%u] Khong tim thay cu chan Trai (CCW)!\n", axisId + 1);
+        sysLogf("[LOI HOMING J%u] Khong tim thay cu chan Trai (CCW)!\n", axisId + 1);
         motor->setCurrent(normalCurrentMa);
         return;
     }
 
-    Serial.printf(">> [HOMING J%u] Da cham cu Trai: %.2f deg. Dang lui 5 deg...\n", axisId + 1, angleMin);
+    sysLogf(">> [HOMING J%u] Da cham cu Trai: %.2f deg. Dang lui %.1f deg...\n", axisId + 1, angleMin, BACKOFF_DEG);
 
-    // Lùi 5 độ an toàn về phía CW (true) bằng vận tốc êm HOMING_STEP_INTERVAL_US
-    moveRawSteps(true, backoffSteps, HOMING_STEP_INTERVAL_US);
+    // Lùi 8 độ an toàn về phía CW (true) với dòng homing khỏe
+    motor->setCurrent(homingCurrentMa);
+    moveRawSteps(true, backoffSteps, homingSpeedUs);
     while (motor->isRunning()) {
         vTaskDelay(pdMS_TO_TICKS(1));
         esp_task_wdt_reset();
@@ -499,14 +569,41 @@ void MotionController::runCenterHoming(bool isDebug) {
 
     // BƯỚC 2: Tìm cữ chặn bên Phải (CW / Max)
     float angleMax = 0.0f;
-    bool foundMax = seekEndstopSmooth(true, MAX_STEPS, angleMax, true);
+    float travel2 = 0.0f;
+    bool foundMax = seekEndstopSmooth(true, MAX_STEPS, angleMax, travel2, true);
+
+    // Tính chính xác cung hành trình và góc trung điểm dựa trên chiều biến thiên thực tế trong Bước 2
+    float strokeDeg = 0.0f;
+    float centerAbsoluteAngle = 0.0f;
 
     if (foundMax) {
-        // TRƯỜNG HỢP 1: CÓ ĐỦ 2 CỮ (TRÁI & PHẢI) -> CĂN GIỮA TRUNG ĐIỂM
-        Serial.printf(">> [HOMING J%u] Da cham cu Phai: %.2f deg. Dang can giua...\n", axisId + 1, angleMax);
+        if (travel2 >= 0.0f) {
+            // Bước 2 quét theo chiều góc cảm biến TĂNG
+            strokeDeg = angleMax - angleMin;
+            if (strokeDeg < 0.0f) strokeDeg += 360.0f;
+            centerAbsoluteAngle = normalizeAngle(angleMin + strokeDeg / 2.0f);
+        } else {
+            // Bước 2 quét theo chiều góc cảm biến GIẢM
+            strokeDeg = angleMin - angleMax;
+            if (strokeDeg < 0.0f) strokeDeg += 360.0f;
+            centerAbsoluteAngle = normalizeAngle(angleMin - strokeDeg / 2.0f);
+        }
 
-        // Lùi 5 độ về phía CCW (false)
-        moveRawSteps(false, backoffSteps, HOMING_STEP_INTERVAL_US);
+        if (strokeDeg < 15.0f || strokeDeg > 350.0f) {
+            sysLogf(">> [CANH BAO HOMING J%u] Cung hanh trinh do duoc (%.2f deg) khong hop ly (<15 deg hoac >350 deg)! Chuyen sang mode 1 cu an toan.\n",
+                    axisId + 1, strokeDeg);
+            foundMax = false;
+        }
+    }
+
+    if (foundMax) {
+        // TRƯỜNG HỢP 1: CÓ ĐỦ 2 CỮ (TRÁI & PHẢI) VÀ CUNG HỢP LÝ -> CĂN CHÍNH GIỮA TRUNG ĐIỂM
+        sysLogf(">> [HOMING J%u] Da cham cu Phai: %.2f deg (Hanh trinh thuc: %.2f deg, Tam: %.2f deg). Dang can giua...\n",
+                axisId + 1, angleMax, strokeDeg, centerAbsoluteAngle);
+
+        // Lùi 8 độ về phía CCW (false) để tách khỏi cữ Phải
+        motor->setCurrent(homingCurrentMa);
+        moveRawSteps(false, backoffSteps, homingSpeedUs);
         while (motor->isRunning()) {
             vTaskDelay(pdMS_TO_TICKS(1));
             esp_task_wdt_reset();
@@ -514,32 +611,25 @@ void MotionController::runCenterHoming(bool isDebug) {
         vTaskDelay(pdMS_TO_TICKS(300));
         esp_task_wdt_reset();
 
-        float arcCW = angleMax - angleMin;
-        if (arcCW < 0.0f) arcCW += 360.0f;
-        float arcCCW = 360.0f - arcCW;
+        float halfStrokeDeg = strokeDeg / 2.0f;
+        totalStrokeDeg = strokeDeg;
 
-        float majorArc = (arcCW >= arcCCW) ? arcCW : arcCCW;
-        float centerAbsoluteAngle = 0.0f;
-        if (arcCW >= arcCCW) {
-            centerAbsoluteAngle = normalizeAngle(angleMin + (majorArc / 2.0f));
-        } else {
-            centerAbsoluteAngle = normalizeAngle(angleMin - (majorArc / 2.0f));
-        }
-
-        float halfStrokeDeg = majorArc / 2.0f;
-        totalStrokeDeg = majorArc;
-
-        float distFromRightToCenter = halfStrokeDeg - 5.0f;
-        if (distFromRightToCenter < 0.0f) distFromRightToCenter = 0.0f;
-        uint32_t stepsToCenter = (uint32_t)(distFromRightToCenter * stepsPerDegree + 0.5f);
-
-        motor->setCurrent(normalCurrentMa);
-        motor->setSpeed(HOMING_STEP_INTERVAL_US);
-
-        moveRawSteps(false, stepsToCenter, HOMING_STEP_INTERVAL_US);
-        while (motor->isRunning()) {
-            vTaskDelay(pdMS_TO_TICKS(1));
-            esp_task_wdt_reset();
+        // Từ vị trí lùi BACKOFF_DEG của cữ Phải, quãng đường cần chạy để về đúng tâm:
+        float distFromRightToCenter = halfStrokeDeg - BACKOFF_DEG;
+        if (distFromRightToCenter > 0.0f) {
+            uint32_t stepsToCenter = (uint32_t)(distFromRightToCenter * stepsPerDegree + 0.5f);
+            moveRawSteps(false, stepsToCenter, homingSpeedUs);
+            while (motor->isRunning()) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+                esp_task_wdt_reset();
+            }
+        } else if (distFromRightToCenter < 0.0f) {
+            uint32_t stepsToCenter = (uint32_t)((-distFromRightToCenter) * stepsPerDegree + 0.5f);
+            moveRawSteps(true, stepsToCenter, homingSpeedUs);
+            while (motor->isRunning()) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+                esp_task_wdt_reset();
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_task_wdt_reset();
@@ -550,15 +640,34 @@ void MotionController::runCenterHoming(bool isDebug) {
         currentAngle = 0.0f;
         limitLeftDeg = -halfStrokeDeg;
         limitRightDeg = +halfStrokeDeg;
+        motor->setCurrent(normalCurrentMa);
         saveSettings();
 
-        Serial.printf("[HOMING J%u] HOAN TAT! Set Home 0.00 deg (Cung hanh trinh: %.2f deg)\n", axisId + 1, totalStrokeDeg);
+        sysLogf("[HOMING J%u] HOAN TAT! Set Home 0.00 deg tai Tam (Hanh trinh: %.2f deg, Gioi han: [%.1f deg, +%.1f deg])\n",
+                axisId + 1, totalStrokeDeg, limitLeftDeg, limitRightDeg);
     } else {
-        // TRƯỜNG HỢP 2: CHỈ CÓ 1 CỮ CHẶN (MIN) -> ĐẶT 0.00° TẠI VỊ TRÍ LÙI CỮ MIN
-        Serial.printf(">> [HOMING J%u] Khong tim thay cu Phai -> Thiet lap Home theo cu Min.\n", axisId + 1);
+        // TRƯỜNG HỢP 2: CHỈ CÓ 1 CỮ CHẶN (MIN) HOẶC TIMEOUT -> QUAY VỀ LÙI 8° TỪ CỮ MIN
+        sysLogf(">> [HOMING J%u] Khong xac dinh duoc cu Phai hop le -> Quay ve lui %.1f deg tu cu Trai de set Home an toan.\n", axisId + 1, BACKOFF_DEG);
 
         float currentAbs = getCorrectedAngle();
-        zeroOffsetAngle = currentAbs;
+        float distToMin = fabsf(getShortestAngleError(currentAbs, angleMin));
+        uint32_t stepsToMin = (uint32_t)(distToMin * stepsPerDegree + 0.5f);
+
+        motor->setCurrent(homingCurrentMa);
+        moveRawSteps(false, stepsToMin, homingSpeedUs);
+        while (motor->isRunning()) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            esp_task_wdt_reset();
+        }
+        vTaskDelay(pdMS_TO_TICKS(150));
+        moveRawSteps(true, backoffSteps, homingSpeedUs);
+        while (motor->isRunning()) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            esp_task_wdt_reset();
+        }
+        vTaskDelay(pdMS_TO_TICKS(150));
+
+        zeroOffsetAngle = getCorrectedAngle();
         isHomed = true;
         targetAngle = 0.0f;
         currentAngle = 0.0f;
@@ -567,7 +676,7 @@ void MotionController::runCenterHoming(bool isDebug) {
         totalStrokeDeg = 185.0f;
         saveSettings();
 
-        Serial.printf("[HOMING J%u] HOAN TAT! Set Home 0.00 deg tai vi tri hien tai.\n", axisId + 1);
+        sysLogf("[HOMING J%u] HOAN TAT! Set Home 0.00 deg tai vi tri lui cu Trai.\n", axisId + 1);
     }
 
     motor->setCurrent(normalCurrentMa);
@@ -623,6 +732,16 @@ void MotionController::stop() {
     inDeadband = false;
     isSynchronizedMove = false;
     motor->stop();
+}
+
+void MotionController::forceStopState() {
+    positioningActive = false;
+    closedLoopHold = false;
+    inDeadband = false;
+    isSynchronizedMove = false;
+    if (motor != nullptr) {
+        motor->stop();
+    }
 }
 
 void MotionController::moveRawSteps(bool cw, uint32_t steps, uint32_t speedUs) {

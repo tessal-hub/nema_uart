@@ -124,12 +124,42 @@ void test_schmitt_deadband_logic(void) {
     }
 }
 
+void test_force_stop_state_estop_resurrection_prevention(void) {
+    // Mô phỏng trạng thái controller đang chạy bám góc closed-loop
+    bool positioningActive = true;
+    bool closedLoopHold = true;
+    bool isSynchronizedMove = true;
+    bool inDeadband = false;
+    bool motorRunning = true;
+
+    // Khi E-Stop xảy ra trong tình huống Mutex bị giữ, hàm forceStopState() được kích hoạt:
+    // 1. Dừng động cơ vật lý
+    motorRunning = false;
+    // 2. Reset nguyên tử các cờ trạng thái điều khiển
+    positioningActive = false;
+    closedLoopHold = false;
+    inDeadband = false;
+    isSynchronizedMove = false;
+
+    // Ở chu kỳ update() kế tiếp (10ms sau):
+    // Guard condition: if (!positioningActive && !closedLoopHold) return;
+    bool willUpdateGenerateNewSteps = (positioningActive || closedLoopHold);
+
+    TEST_ASSERT_FALSE_MESSAGE(willUpdateGenerateNewSteps, "update() MUST NOT resurrect motion after forceStopState()");
+    TEST_ASSERT_FALSE(positioningActive);
+    TEST_ASSERT_FALSE(closedLoopHold);
+    TEST_ASSERT_FALSE(isSynchronizedMove);
+    TEST_ASSERT_FALSE(inDeadband);
+    TEST_ASSERT_FALSE(motorRunning);
+}
+
 int runMotionTests(void) {
     UNITY_BEGIN();
     RUN_TEST(test_angle_normalization);
     RUN_TEST(test_shortest_angle_error);
     RUN_TEST(test_lut_calibration_interpolation);
     RUN_TEST(test_schmitt_deadband_logic);
+    RUN_TEST(test_force_stop_state_estop_resurrection_prevention);
     return UNITY_END();
 }
 

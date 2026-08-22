@@ -253,9 +253,9 @@ void Motor::begin(uint16_t initialCurrentMa, uint16_t initialMicrosteps,
     driver->ihold(holdScale);
     driver->iholddelay(iholddelay);
 
-    // Initial direction
+    // Initial direction: force cache invalidation so the first setDirection() always sends UART
     driver->shaft(false);
-    lastShaftDir = 0;
+    lastShaftDir = -1;
 
     if (uartMutex != nullptr && *uartMutex != nullptr) {
         xSemaphoreGive(*uartMutex);
@@ -283,11 +283,11 @@ void Motor::setDirection(bool cw) {
     // 2. UART register direction control - CHỈ gửi UART khi chiều thực sự THAY ĐỔI
     if (lastShaftDir != (int8_t)cw) {
         if (uartMutex != nullptr && *uartMutex != nullptr) {
-            if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(25)) == pdTRUE) {
+            if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 if (serialPort != nullptr) {
                     while (serialPort->available()) serialPort->read();
                 }
-                driver->shaft(!cw);
+                driver->shaft(cw);
                 lastShaftDir = (int8_t)cw;
                 xSemaphoreGive(*uartMutex);
             }
@@ -295,7 +295,7 @@ void Motor::setDirection(bool cw) {
             if (serialPort != nullptr) {
                 while (serialPort->available()) serialPort->read();
             }
-            driver->shaft(!cw);
+            driver->shaft(cw);
             lastShaftDir = (int8_t)cw;
         }
     }
