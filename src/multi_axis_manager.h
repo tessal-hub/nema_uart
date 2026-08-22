@@ -54,6 +54,7 @@ public:
     void triggerJointHome(uint8_t axis);
     void triggerJointZero(uint8_t axis);
     void triggerJointCalib(uint8_t axis);
+    void triggerJointAutoDir(uint8_t axis);
     void stopJoint(uint8_t axis);
 
     // --- Multi-Axis Coordinated Controls ---
@@ -66,6 +67,7 @@ public:
     void emergencyStopAll();
     void triggerAllHome();
     void triggerAllZero();
+    void triggerAllAutoDir();
     void setAllDriversEnabled(bool enabled);
 
     // --- Waypoint & Trajectory Sequence Management ---

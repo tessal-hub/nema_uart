@@ -40,6 +40,15 @@ void MultiAxisManager::taskLoop() {
     while (taskRunning) {
         esp_task_wdt_reset();
 
+        // 1. Thực thi các tác vụ chạy dài (Homing, Calib, AutoDir) NGOÀI stateMutex
+        //    để Web Server và các tác vụ khác không bao giờ bị nghẽn (Zero-Blocking)
+        for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+            if (controllers[i] != nullptr && controllers[i]->hasPendingTask()) {
+                controllers[i]->executePendingTask();
+            }
+        }
+
+        // 2. Vòng lặp điều khiển thời gian thực ngắn (5ms)
         if (stateMutex != nullptr && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             for (uint8_t i = 0; i < NUM_MOTORS; i++) {
                 if (controllers[i] != nullptr) {
@@ -183,6 +192,11 @@ void MultiAxisManager::triggerJointCalib(uint8_t axis) {
     controllers[axis]->triggerCalib();
 }
 
+void MultiAxisManager::triggerJointAutoDir(uint8_t axis) {
+    if (axis >= NUM_MOTORS || controllers[axis] == nullptr) return;
+    controllers[axis]->triggerAutoDir();
+}
+
 void MultiAxisManager::stopJoint(uint8_t axis) {
     if (axis >= NUM_MOTORS || controllers[axis] == nullptr) return;
     if (stateMutex != nullptr && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -317,6 +331,14 @@ void MultiAxisManager::triggerAllZero() {
     for (uint8_t i = 0; i < NUM_MOTORS; i++) {
         if (controllers[i] != nullptr) {
             controllers[i]->triggerZero();
+        }
+    }
+}
+
+void MultiAxisManager::triggerAllAutoDir() {
+    for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+        if (controllers[i] != nullptr) {
+            controllers[i]->triggerAutoDir();
         }
     }
 }

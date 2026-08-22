@@ -156,11 +156,11 @@ void Sensor::scanOnce() {
         read_fail_counts[i] = 0;
         sensor_error[i] = false;
 
-        float angle = filter(i, raw);
-
         if (dataMutex != nullptr && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(SENSOR_I2C_MUTEX_TIMEOUT_MS)) == pdTRUE) {
-            filtered_angles[i] = angle;
+            filter(i, raw);
             xSemaphoreGive(dataMutex);
+        } else {
+            filter(i, raw);
         }
     }
 
@@ -212,7 +212,12 @@ void Sensor::begin(uint8_t coreID, uint8_t priority, uint32_t period_ms) {
     Wire.setTimeOut(15);
 
     dataMutex = xSemaphoreCreateMutex();
-    i2cMutex = xSemaphoreCreateMutex();
+    i2cMutex  = xSemaphoreCreateMutex();
+
+    if (dataMutex == nullptr || i2cMutex == nullptr) {
+        Serial.println("[FATAL] Sensor: Failed to create mutexes! Check heap.");
+        return;
+    }
 
     for (uint8_t i = 0; i < NUM_SENSORS; i++) {
         setPCAChannel(i);
@@ -260,7 +265,14 @@ float Sensor::getAccumulatedAngle(uint8_t ch) {
 
 int32_t Sensor::getTurnCount(uint8_t ch) {
     if (ch >= NUM_SENSORS) return 0;
-    return turn_counts[ch];
+    int32_t val = 0;
+    if (dataMutex != nullptr && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        val = turn_counts[ch];
+        xSemaphoreGive(dataMutex);
+    } else {
+        val = turn_counts[ch];
+    }
+    return val;
 }
 
 void Sensor::resetAccumulatedAngle(uint8_t ch) {

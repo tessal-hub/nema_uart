@@ -6,6 +6,7 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <Update.h>
 #include "config.h"
 #include "multi_axis_manager.h"
 #include "sensor.h"
@@ -21,9 +22,12 @@ private:
 
     void setupRoutes();
     bool parseAxis(uint8_t& outAxis);
+    void sendJson(int code, const String& json);
+    void sendJsonError(int code, const char* msg);
 
     // API Handlers
     void handleStatus();
+    void handleDiagnostics();
     void handleMotorGoto();
     void handleMotorJog();
     void handleMotorStep();
@@ -34,12 +38,14 @@ private:
     void handleMotorZero();
     void handleMotorCalib();
     void handleMotorCalibClear();
+    void handleMotorAutoDir();
     void handleMotorSettings();
 
     void handleAllGoto();
     void handleAllStop();
     void handleAllHome();
     void handleAllZero();
+    void handleAllAutoDir();
     void handleAllEnable();
 
     void handleIKGoto();
@@ -56,10 +62,15 @@ private:
     void handleWifiSave();
     void handleWifiClear();
     void handleSystemReboot();
+    void handleOtaUpload();        // HTTP OTA: POST /api/ota/update
+    void handleCli();              // CLI execute: POST /api/cli
+
+    std::function<String(const String&)> commandHandler;
 
 public:
-    WebServerManager(MultiAxisManager* mam, Sensor* s);
-    void begin(const char* apSsid = DEFAULT_AP_SSID, const char* apPass = DEFAULT_AP_PASS);
+    WebServerManager(MultiAxisManager* axes, Sensor* sns);
+    void setCommandHandler(std::function<String(const String&)> handler) { commandHandler = handler; }
+    void begin(const char* apSSID = "NEMA-6AXIS-CONTROLLER", const char* apPassword = "");
     void handle();
 };
 

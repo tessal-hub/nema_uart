@@ -8,12 +8,20 @@
 // 1. FIRMWARE METADATA & SYSTEM SCALING
 // ==============================================================================
 #define FW_NAME           "NEMA-6AXIS-PRO"
-#define FW_VERSION        "v2.2.0-DH-CONFIRMED"
-#define FW_BUILD_DATE     "2026-08-20"
+#define FW_VERSION        "v2.3.0"
+#define FW_BUILD_DATE     __DATE__            // Injected automatically by compiler
 
 #define NUM_MOTORS        6
 #define NUM_SENSORS       6
 #define MAX_WAYPOINTS     32
+
+// ==============================================================================
+// 1b. WATCHDOG & OTA CONFIGURATION
+// ==============================================================================
+#define WDT_TIMEOUT_SEC           8           // Task watchdog timeout (seconds)
+#define OTA_PORT                  3232        // ArduinoOTA UDP port (standard)
+#define OTA_PASSWORD_HASH         ""          // Set to MD5 hash of OTA password, or "" to disable auth
+#define HTTP_OTA_MAX_SIZE_BYTES   1900000     // Max firmware binary size for HTTP OTA (~1.9 MB)
 
 // ==============================================================================
 // 2. I2C & AS5600 MAGNETIC ENCODER (PCA9548A MULTIPLEXER)
@@ -72,15 +80,37 @@
 // ==============================================================================
 // 4. MOTION & CLOSED-LOOP CONTROL DEFAULTS
 // ==============================================================================
-#define DEFAULT_GEAR_RATIO        6.0f     // 6:1 gear ratio default
+// Tỉ số truyền độc lập cho từng khớp J1..J6 (Gear Ratios):
+// - Giá trị dương (+) : Chiều quay động cơ cùng chiều cảm biến góc AS5600
+// - Giá trị âm (-)    : Hộp số đảo chiều (ví dụ: hành tinh 1 cấp, bánh răng spur, belt đảo chiều)
+#define GEAR_RATIO_J1             6.0f     // Joint 1 (Base Yaw) - Tỉ số truyền 6:1
+#define GEAR_RATIO_J2             -20.0f    // Joint 2 (Shoulder Pitch) - Tỉ số truyền 30:1
+#define GEAR_RATIO_J3             -20.0f   // Joint 3 (Elbow Pitch) - Ví dụ tỉ số truyền âm -30:1 (đảo chiều)
+#define GEAR_RATIO_J4             4.0f     // Joint 4 (Wrist Roll) - Truyền trực tiếp 1:1
+#define GEAR_RATIO_J5             3.0f   // Joint 5 (Wrist Pitch) - Ví dụ tỉ số truyền âm -10:1 (đảo chiều)
+#define GEAR_RATIO_J6             3.0f     // Joint 6 (Flange Roll) - Truyền trực tiếp 1:1
+
+// Mảng tỉ số truyền mặc định cho 6 trục
+static const float DEFAULT_AXIS_GEAR_RATIOS[NUM_MOTORS] = {
+    GEAR_RATIO_J1,
+    GEAR_RATIO_J2,
+    GEAR_RATIO_J3,
+    GEAR_RATIO_J4,
+    GEAR_RATIO_J5,
+    GEAR_RATIO_J6
+};
+
+#define DEFAULT_GEAR_RATIO        GEAR_RATIO_J1 // Fallback default
 #define DEFAULT_FULL_STEPS        200      // 1.8 degree stepper (200 steps/rev)
 #define DEFAULT_MICROSTEPS        16       // 1/16 microstepping
 #define DEFAULT_NORMAL_CURRENT    800      // Normal running current (mA)
-#define DEFAULT_HOMING_CURRENT    550      // Safe stall current for homing (mA)
+#define DEFAULT_HOMING_CURRENT    750      // High-torque current for homing through gearbox friction (mA)
 #define DEFAULT_HOLD_SCALE        8        // TMC2209 ihold scale (0..31)
+#define DEFAULT_STALL_THRESHOLD   60       // TMC2209 StallGuard4 sensitivity threshold (0..255)
 
 // Speed & Acceleration Timing (in microseconds per step pulse)
 #define DEFAULT_STEP_INTERVAL_US  400      // Target step interval (us) -> 2500 steps/sec
+#define HOMING_STEP_INTERVAL_US   1600     // Safe, high-torque crawl speed for homing (us) -> 625 steps/sec
 #define MIN_STEP_INTERVAL_US      120      // Max speed limit (us) -> ~8333 steps/sec
 #define MAX_STEP_INTERVAL_US      2500     // Starting / Creep speed interval (us)
 #define DEFAULT_ACCEL_RATE        12       // Microseconds interval delta per acceleration step
@@ -138,5 +168,6 @@
 #define DEFAULT_AP_PASS           "12345678"
 #define DEFAULT_MDNS_HOST         "nema"
 #define WEB_SERVER_PORT           80
+#define OTA_HOSTNAME              DEFAULT_MDNS_HOST    // ArduinoOTA advertised hostname
 
 #endif // CONFIG_H

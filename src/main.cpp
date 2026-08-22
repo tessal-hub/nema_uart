@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <ArduinoOTA.h>
 #include <esp_task_wdt.h>
 #include "config.h"
 #include "motor.h"
@@ -39,6 +41,10 @@ MotionController* controllerList[NUM_MOTORS] = { &ctrl0, &ctrl1, &ctrl2, &ctrl3,
 // ==============================================================================
 MultiAxisManager axisManager(motorList, controllerList, &sensor);
 WebServerManager webServer(&axisManager, &sensor);
+
+// Mutex bảo vệ truy cập UART đa điểm trên Serial1 và Serial2
+SemaphoreHandle_t uartMutex1 = nullptr;
+SemaphoreHandle_t uartMutex2 = nullptr;
 
 // Buffer đọc lệnh từ Serial CLI
 String inputString = "";
@@ -133,73 +139,82 @@ void printHelpMenu() {
 // ==============================================================================
 // 5. XỬ LÝ LỆNH TỪ SERIAL CLI & G-CODE
 // ==============================================================================
-void handleSerialCommand(String cmd) {
+String handleSerialCommand(String cmd) {
     cmd.trim();
-    if (cmd.length() == 0) return;
+    if (cmd.length() == 0) return "";
 
     // 1. Lệnh Dừng Khẩn Cấp Toàn Cục
     if (cmd.equalsIgnoreCase("STOP") || cmd.equalsIgnoreCase("EMERGENCY STOP") ||
         cmd.equalsIgnoreCase("S") || cmd.equalsIgnoreCase("M112")) {
         axisManager.emergencyStopAll();
         Serial.println(">> [SERIAL] ⛔ DA DUNG KHAN CAP TAT CA 6 TRUC!");
-        return;
+        return "⛔ DA DUNG KHAN CAP TAT CA 6 TRUC!";
     }
 
     // 2. Lệnh Trợ Giúp / Thông Tin
+    // 2. Lệnh Trợ Giúp / Thông Tin
     if (cmd.equalsIgnoreCase("HELP") || cmd.equalsIgnoreCase("?")) {
         printHelpMenu();
-        return;
+        return "Type HELP in Serial monitor for full menu";
     }
 
     if (cmd.equalsIgnoreCase("STATUS") || cmd.equalsIgnoreCase("M114")) {
         printSystemStatus();
-        return;
+        return "Printed status to Serial";
     }
 
     if (cmd.equalsIgnoreCase("TEST UART") || cmd.equalsIgnoreCase("UART") || cmd.equalsIgnoreCase("TEST")) {
         testAllUarts();
-        return;
+        return "UART test complete";
     }
 
     if (cmd.equalsIgnoreCase("POSE")) {
         CartesianPose pose = {0};
         axisManager.getCartesianPose(pose);
-        Serial.printf(">> [TCP POSE] X=%.2f mm, Y=%.2f mm, Z=%.2f mm | Roll=%.2f°, Pitch=%.2f°, Yaw=%.2f°\n",
-                      pose.x, pose.y, pose.z, pose.roll, pose.pitch, pose.yaw);
-        return;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "X=%.1f mm, Y=%.1f mm, Z=%.1f mm, R=%.1f, P=%.1f, Y=%.1f",
+                 pose.x, pose.y, pose.z, pose.roll, pose.pitch, pose.yaw);
+        Serial.printf(">> [TCP POSE] %s\n", buf);
+        return String(buf);
     }
 
     if (cmd.equalsIgnoreCase("REBOOT")) {
-        Serial.println(">> [SYSTEM] Dang khoi dong lai ESP32...");
+        Serial.println(">> [SYSTEM] Rebooting ESP32...");
         delay(500);
         ESP.restart();
-        return;
+        return "Rebooting...";
     }
 
     // 3. G-code Standard Commands (G0, G1, G28, M17, M18, M84)
     if (cmd.equalsIgnoreCase("G28") || cmd.equalsIgnoreCase("ALL HOME")) {
         axisManager.triggerAllHome();
         Serial.println(">> [G28] Bat dau Homing tat ca 6 truc...");
-        return;
+        return "G28: Homing all axes...";
     }
 
     if (cmd.equalsIgnoreCase("M17") || cmd.equalsIgnoreCase("ALL ENABLE")) {
         axisManager.setAllDriversEnabled(true);
         Serial.println(">> [M17] Bat cap nguon Driver tat ca 6 truc.");
-        return;
+        return "M17: Enabled all drivers";
     }
 
     if (cmd.equalsIgnoreCase("M18") || cmd.equalsIgnoreCase("M84") ||
         cmd.equalsIgnoreCase("ALL FREE") || cmd.equalsIgnoreCase("ALL DISABLE")) {
         axisManager.setAllDriversEnabled(false);
         Serial.println(">> [M18/M84] Tha tu do tat ca 6 truc.");
-        return;
+        return "M18/M84: Disabled all drivers";
     }
 
     if (cmd.equalsIgnoreCase("ALL ZERO")) {
         axisManager.triggerAllZero();
         Serial.println(">> [ALL ZERO] Da dat mốc Home 0.00 deg cho tat ca cac truc.");
-        return;
+        return "All axes zeroed";
+    }
+
+    if (cmd.equalsIgnoreCase("ALL AUTODIR") || cmd.equalsIgnoreCase("ALL DIR")) {
+        axisManager.triggerAllAutoDir();
+        Serial.println(">> [ALL AUTODIR] Dang tu dong kiem tra va luu chieu quay 6 truc...");
+        return "All axes auto-direction started";
     }
 
     // G0 / G1 Cartesian Motions
@@ -239,12 +254,13 @@ void handleSerialCommand(String cmd) {
             ok = axisManager.moveCartesianLinear(targetPose, feedRate);
             Serial.printf(">> [G1 LINEAR] Den [X:%.1f, Y:%.1f, Z:%.1f] @ Feed: %.1f mm/s (%s)\n",
                           targetPose.x, targetPose.y, targetPose.z, feedRate, ok ? "OK" : "LOI TAM VOI");
+            return ok ? "G1 Linear motion started" : "G1 Error: Reach limit";
         } else {
             ok = axisManager.setCartesianPose(targetPose, {100, 0.1f, 0.01f}, moveTime);
             Serial.printf(">> [G0 RAPID] Den [X:%.1f, Y:%.1f, Z:%.1f] (T=%.1fs) (%s)\n",
                           targetPose.x, targetPose.y, targetPose.z, moveTime, ok ? "OK" : "LOI TAM VOI");
+            return ok ? "G0 Rapid motion started" : "G0 Error: Reach limit";
         }
-        return;
     }
 
     // ALL <a1> <a2> <a3> <a4> <a5> <a6> [time]
@@ -271,10 +287,11 @@ void handleSerialCommand(String cmd) {
             axisManager.setTargetAnglesSync(targets, moveTime, true);
             Serial.printf(">> [SERIAL ALL] Dang quay dong bo 6 truc: [%.1f, %.1f, %.1f, %.1f, %.1f, %.1f] (T=%.1fs)\n",
                           targets[0], targets[1], targets[2], targets[3], targets[4], targets[5], moveTime);
+            return "ALL: Coordinated motion started";
         } else {
             Serial.println(">> [SERIAL ERROR] Lenh ALL can 6 goc (vd: ALL 0 45 -30 90 0 0 [time])");
+            return "Error: ALL requires 6 angles";
         }
-        return;
     }
 
     // 4. Lệnh Động Học Không Gian IK <x> <y> <z> [roll] [pitch] [yaw] [time]
@@ -308,13 +325,15 @@ void handleSerialCommand(String cmd) {
             if (ok) {
                 Serial.printf(">> [IK GOTO] Di chuyen TCP den [X:%.1f, Y:%.1f, Z:%.1f] (T=%.1fs)\n",
                               targetPose.x, targetPose.y, targetPose.z, moveTime);
+                return "IK Target Accepted";
             } else {
                 Serial.println(">> [IK ERROR] Toa do ngoai tam voi hoac vi pham gioi han khop!");
+                return "IK Error: Unreachable or joint limit";
             }
         } else {
             Serial.println(">> [IK ERROR] Cu phap: IK <x> <y> <z> [roll] [pitch] [yaw] [time]");
+            return "Syntax: IK <x> <y> <z> [roll] [pitch] [yaw] [time]";
         }
-        return;
     }
 
     // 5. Lệnh Waypoints & Quỹ Đạo
@@ -334,6 +353,7 @@ void handleSerialCommand(String cmd) {
                 }
             }
             Serial.println("----------------------------------------\n");
+            return "Waypoint list printed to Serial";
         } else if (sub.startsWith("ADD ") || sub.startsWith("add ")) {
             String name = sub.substring(4);
             name.trim();
@@ -341,21 +361,26 @@ void handleSerialCommand(String cmd) {
             axisManager.getAllAngles(joints);
             axisManager.addWaypoint(name.c_str(), joints, 2.0f, 500);
             Serial.printf(">> [WP] Da them Waypoint: %s\n", name.c_str());
+            return "Waypoint added: " + name;
         } else if (sub.startsWith("START") || sub.startsWith("start")) {
             bool loop = sub.indexOf("LOOP") > 0 || sub.indexOf("loop") > 0;
             axisManager.startSequence(loop);
             Serial.printf(">> [WP] Bat dau chay quy dao (Loop: %s)\n", loop ? "TRUE" : "FALSE");
+            return "Sequence started";
         } else if (sub.equalsIgnoreCase("PAUSE")) {
             axisManager.pauseSequence();
             Serial.println(">> [WP] Tam dung chuoi quy dao.");
+            return "Sequence paused";
         } else if (sub.equalsIgnoreCase("STOP")) {
             axisManager.stopSequence();
             Serial.println(">> [WP] Dung chuoi quy dao.");
+            return "Sequence stopped";
         } else if (sub.equalsIgnoreCase("CLEAR")) {
             axisManager.clearWaypoints();
             Serial.println(">> [WP] Da xoa tat ca cac Waypoints.");
+            return "Waypoints cleared";
         }
-        return;
+        return "Unknown WP command";
     }
 
     // 6. Lệnh Cho Từng Khớp: M1..M6 <command>
@@ -363,61 +388,82 @@ void handleSerialCommand(String cmd) {
         uint8_t axis = cmd.charAt(1) - '1';
         if (axis >= NUM_MOTORS) {
             Serial.printf(">> [SERIAL ERROR] Khong co truc M%d (Chi ho tro M1-M6)\n", axis + 1);
-            return;
+            return "Error: Invalid motor index (M1-M6)";
         }
 
         String sub = cmd.substring(2);
         sub.trim();
 
-        if (sub.length() == 0) return;
+        if (sub.length() == 0) return "Motor " + String(axis + 1);
 
         // M<x> <angle> (vd: M1 45.0)
         if (isdigit(sub.charAt(0)) || (sub.charAt(0) == '-' && sub.length() > 1 && isdigit(sub.charAt(1)))) {
             float ang = sub.toFloat();
             axisManager.setJointTarget(axis, ang);
             Serial.printf(">> [SERIAL M%d] Dat goc muc tieu: %.2f deg\n", axis + 1, ang);
-            return;
+            return "M" + String(axis + 1) + " target: " + String(ang, 2);
         }
 
         if (sub.startsWith("JOG ") || sub.startsWith("jog ")) {
             float delta = sub.substring(4).toFloat();
             axisManager.jogJoint(axis, delta);
             Serial.printf(">> [SERIAL M%d] Nhich goc: %+.2f deg\n", axis + 1, delta);
+            return "M" + String(axis + 1) + " jog: " + String(delta, 2);
         } else if (sub.equalsIgnoreCase("HOME") || sub.equalsIgnoreCase("HOMING")) {
             axisManager.triggerJointHome(axis);
             Serial.printf(">> [SERIAL M%d] Bat dau Homing cung lon...\n", axis + 1);
+            return "M" + String(axis + 1) + " homing started";
         } else if (sub.equalsIgnoreCase("ZERO")) {
             axisManager.triggerJointZero(axis);
             Serial.printf(">> [SERIAL M%d] Dat mốc Home 0.00 deg tai vi tri hien tai.\n", axis + 1);
+            return "M" + String(axis + 1) + " zero set";
         } else if (sub.equalsIgnoreCase("CALIB")) {
             axisManager.triggerJointCalib(axis);
             Serial.printf(">> [SERIAL M%d] Bat dau Auto Calib LUT 16 diem...\n", axis + 1);
+            return "M" + String(axis + 1) + " calibration started";
         } else if (sub.equalsIgnoreCase("CALIB CLEAR")) {
             controllerList[axis]->clearCalibration();
             Serial.printf(">> [SERIAL M%d] Da xoa bang hieu chuan Calib.\n", axis + 1);
+            return "M" + String(axis + 1) + " calib cleared";
+        } else if (sub.equalsIgnoreCase("AUTODIR") || sub.equalsIgnoreCase("DIR")) {
+            axisManager.triggerJointAutoDir(axis);
+            Serial.printf(">> [SERIAL M%d] Dang tu dong kiem tra chieu quay...\n", axis + 1);
+            return "M" + String(axis + 1) + " autodir started";
         } else if (sub.equalsIgnoreCase("STOP")) {
             axisManager.stopJoint(axis);
             Serial.printf(">> [SERIAL M%d] Dung dong co.\n", axis + 1);
+            return "M" + String(axis + 1) + " stopped";
         } else if (sub.startsWith("INVERT ") || sub.startsWith("invert ")) {
             bool inv = sub.substring(7).toInt() == 1;
             controllerList[axis]->setDirInvert(inv);
             Serial.printf(">> [SERIAL M%d] Da cai dat Invert = %s\n", axis + 1, inv ? "TRUE" : "FALSE");
+            return "M" + String(axis + 1) + " invert set";
         } else if (sub.startsWith("HOLD ") || sub.startsWith("hold ")) {
             bool h = sub.substring(5).toInt() == 1;
             controllerList[axis]->setClosedLoopHold(h);
             Serial.printf(">> [SERIAL M%d] Da cai dat Closed-Loop Hold = %s\n", axis + 1, h ? "TRUE" : "FALSE");
+            return "M" + String(axis + 1) + " hold set";
         } else if (sub.startsWith("SPEED ") || sub.startsWith("speed ")) {
             uint32_t spd = (uint32_t)sub.substring(6).toInt();
             controllerList[axis]->setSpeed(spd);
             Serial.printf(">> [SERIAL M%d] Da cai dat Speed = %u us\n", axis + 1, spd);
+            return "M" + String(axis + 1) + " speed set";
         } else if (sub.startsWith("CURR ") || sub.startsWith("curr ")) {
             uint16_t cr = (uint16_t)sub.substring(5).toInt();
             controllerList[axis]->setCurrent(cr);
             Serial.printf(">> [SERIAL M%d] Da cai dat RMS Current = %u mA\n", axis + 1, cr);
+            return "M" + String(axis + 1) + " current set";
+        } else if (sub.startsWith("HOMECURR ") || sub.startsWith("homecurr ") || sub.startsWith("HCURR ") || sub.startsWith("hcurr ")) {
+            int spIdx = sub.indexOf(' ');
+            uint16_t hcr = (uint16_t)sub.substring(spIdx + 1).toInt();
+            controllerList[axis]->setHomingCurrent(hcr);
+            Serial.printf(">> [SERIAL M%d] Da cai dat Homing Current = %u mA\n", axis + 1, hcr);
+            return "M" + String(axis + 1) + " homing current set to " + String(hcr) + " mA";
         } else if (sub.startsWith("GEAR ") || sub.startsWith("gear ")) {
             float gr = sub.substring(5).toFloat();
             controllerList[axis]->setGearRatio(gr);
             Serial.printf(">> [SERIAL M%d] Da cai dat Gear Ratio = %.2f : 1\n", axis + 1, gr);
+            return "M" + String(axis + 1) + " gear ratio set";
         } else if (sub.startsWith("STEP ") || sub.startsWith("step ")) {
             String stepArgs = sub.substring(5);
             stepArgs.trim();
@@ -429,27 +475,33 @@ void handleSerialCommand(String cmd) {
             if (st >= 0) axisManager.moveJointRawSteps(axis, true, (uint32_t)st, spd);
             else axisManager.moveJointRawSteps(axis, false, (uint32_t)(-st), spd);
             Serial.printf(">> [SERIAL M%d] Quay %ld buoc raw.\n", axis + 1, st);
+            return "M" + String(axis + 1) + " step executed";
         } else if (sub.startsWith("RUN CW") || sub.startsWith("run cw")) {
             axisManager.runJointContinuous(axis, true);
             Serial.printf(">> [SERIAL M%d] Quay lien tuc CW.\n", axis + 1);
+            return "M" + String(axis + 1) + " running CW";
         } else if (sub.startsWith("RUN CCW") || sub.startsWith("run ccw")) {
             axisManager.runJointContinuous(axis, false);
             Serial.printf(">> [SERIAL M%d] Quay lien tuc CCW.\n", axis + 1);
+            return "M" + String(axis + 1) + " running CCW";
         } else if (sub.equalsIgnoreCase("FREE") || sub.equalsIgnoreCase("DISABLE")) {
             axisManager.setJointDriverEnabled(axis, false);
             Serial.printf(">> [SERIAL M%d] Tha tu do truc.\n", axis + 1);
+            return "M" + String(axis + 1) + " disabled";
         } else if (sub.equalsIgnoreCase("ENABLE")) {
             axisManager.setJointDriverEnabled(axis, true);
             Serial.printf(">> [SERIAL M%d] Bat cap nguon Driver.\n", axis + 1);
+            return "M" + String(axis + 1) + " enabled";
         }
-        return;
+        return "Unknown motor command";
     }
 
-    Serial.println(">> [SERIAL] Lenh khong hop le. Nhap 'HELP' de xem danh sach lenh.");
+    Serial.println(">> [SERIAL] Invalid command. Type 'HELP' to see command list.");
+    return "Invalid command. Type 'HELP'.";
 }
 
 // ==============================================================================
-// 6. SETUP & KHỞI ĐỘNG HỆ THỐNG
+// 6. SETUP & SYSTEM BOOT
 // ==============================================================================
 void setup() {
     Serial.begin(115200);
@@ -460,26 +512,44 @@ void setup() {
     Serial.println("   Author: Robotics & Motion Control Engineering Team                     ");
     Serial.println("==========================================================================");
 
-    // 0. Khởi động Task Watchdog Timer (5s timeout)
-    esp_task_wdt_init(5, true);
+    // 0. Initialize Task Watchdog Timer
+    //    arduino-esp32 3.x ships IDF 5.1 where esp_task_wdt_init(uint32_t, bool) is still valid.
+    //    (esp_task_wdt_reconfigure/config_t are IDF 5.2+ only)
+    esp_task_wdt_init(WDT_TIMEOUT_SEC, true);   // timeout, trigger_panic
 
-    // 1. Khởi động Task đọc 6 cảm biến AS5600 qua PCA9548A trên Core 0 (500Hz)
-    Serial.println("[INIT] Khoi dong AS5600 6-Channel Task (PCA9548A Core 0, 500Hz)...");
+    // 1. Start AS5600 6-Channel sensor task (PCA9548A on Core 0, 500Hz)
+    Serial.println("[INIT] Starting AS5600 6-Channel Task (PCA9548A Core 0, 500Hz)...");
     sensor.begin(SENSOR_TASK_CORE, SENSOR_TASK_PRIORITY, SENSOR_TASK_PERIOD_MS);
     delay(100);
 
-    // 2. Khởi động Dual Hardware Serial (Serial1 & Serial2)
-    Serial.printf("[INIT] Khoi dong Serial1 cho M1-M4 (TX: %d, RX: %d)...\n", TX_PIN_1, RX_PIN_1);
+    // 2. Create UART mutexes and start dual hardware serial ports
+    uartMutex1 = xSemaphoreCreateMutex();
+    uartMutex2 = xSemaphoreCreateMutex();
+    if (uartMutex1 == nullptr || uartMutex2 == nullptr) {
+        Serial.println("[FATAL] Failed to create UART mutexes! Rebooting...");
+        delay(1000);
+        ESP.restart();
+    }
+
+    motor0.setUartMutex(&uartMutex1);
+    motor1.setUartMutex(&uartMutex1);
+    motor2.setUartMutex(&uartMutex1);
+    motor3.setUartMutex(&uartMutex1);
+
+    motor4.setUartMutex(&uartMutex2);
+    motor5.setUartMutex(&uartMutex2);
+
+    Serial.printf("[INIT] Starting Serial1 for M1-M4 (TX: %d, RX: %d)...\n", TX_PIN_1, RX_PIN_1);
     SERIAL_PORT_1.begin(TMC_UART_BAUD, SERIAL_8N1, RX_PIN_1, TX_PIN_1);
 
-    Serial.printf("[INIT] Khoi dong Serial2 cho M5-M6 (TX: %d, RX: %d)...\n", TX_PIN_2, RX_PIN_2);
+    Serial.printf("[INIT] Starting Serial2 for M5-M6 (TX: %d, RX: %d)...\n", TX_PIN_2, RX_PIN_2);
     SERIAL_PORT_2.begin(TMC_UART_BAUD, SERIAL_8N1, RX_PIN_2, TX_PIN_2);
 
-    // 3. Khởi động Multi-Axis Motion Control Task trên Core 1 (100Hz)
-    Serial.println("[INIT] Khoi dong 6-Axis Motion Control Task (Core 1, 100Hz)...");
+    // 3. Start multi-axis motion control task on Core 1 (100Hz)
+    Serial.println("[INIT] Starting 6-Axis Motion Control Task (Core 1, 100Hz)...");
     axisManager.begin(MOTION_TASK_CORE, MOTION_TASK_PRIORITY, MOTION_TASK_PERIOD_MS);
 
-    // 4. Khởi tạo một số Waypoints mẫu hữu ích
+    // 4. Pre-load sample waypoints
     float pHome[NUM_MOTORS]  = { 0.0f,   0.0f,  0.0f, 0.0f,   0.0f, 0.0f };
     float pReady[NUM_MOTORS] = { 0.0f, -30.0f, 45.0f, 0.0f,  30.0f, 0.0f };
     float pReach[NUM_MOTORS] = { 0.0f,  30.0f, 30.0f, 0.0f, -45.0f, 0.0f };
@@ -487,29 +557,71 @@ void setup() {
     axisManager.addWaypoint("Ready", pReady, 2.0f, 500);
     axisManager.addWaypoint("Reach", pReach, 2.0f, 500);
 
-    // 5. In kết quả kiểm tra UART của 6 driver
+    // 5. Test UART connectivity of all 6 drivers
     testAllUarts();
 
-    // 6. Khởi tạo Web Server & Wi-Fi Kép (AP + STA)
+    // 6. Start Web Server & dual WiFi (AP + STA)
+    webServer.setCommandHandler(handleSerialCommand);
     webServer.begin(DEFAULT_AP_SSID, DEFAULT_AP_PASS);
 
-    Serial.println("[READY] He thong 6 truc da san sang hoat dong! Nhap 'HELP' de xem cac lenh.");
+    // 7. Configure ArduinoOTA (port-based wireless firmware upload)
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    ArduinoOTA.setPort(OTA_PORT);
+    // Optional: ArduinoOTA.setPasswordHash(OTA_PASSWORD_HASH);
+
+    ArduinoOTA.onStart([]() {
+        String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
+        // Stop all motion safely before OTA
+        axisManager.emergencyStopAll();
+        Serial.printf("\n[OTA] Starting update: %s\n", type.c_str());
+    });
+    ArduinoOTA.onEnd([]() {
+        Serial.println("\n[OTA] Update complete! Rebooting...");
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        static uint8_t lastPct = 0xFF;
+        uint8_t pct = (uint8_t)(progress * 100U / total);
+        if (pct != lastPct) {
+            lastPct = pct;
+            Serial.printf("[OTA] Progress: %u%%\r", pct);
+        }
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        const char* errStr = "Unknown";
+        switch (error) {
+            case OTA_AUTH_ERROR:    errStr = "Auth Failed";    break;
+            case OTA_BEGIN_ERROR:   errStr = "Begin Failed";   break;
+            case OTA_CONNECT_ERROR: errStr = "Connect Failed"; break;
+            case OTA_RECEIVE_ERROR: errStr = "Receive Failed"; break;
+            case OTA_END_ERROR:     errStr = "End Failed";     break;
+        }
+        Serial.printf("[OTA] Error[%u]: %s\n", error, errStr);
+    });
+    ArduinoOTA.begin();
+    Serial.printf("[OTA] ArduinoOTA ready on '%s.local' port %d\n", OTA_HOSTNAME, OTA_PORT);
+
+    Serial.println("[READY] 6-axis system ready! Type 'HELP' for command list.");
 }
 
 // ==============================================================================
-// 7. VÒNG LẶP CHÍNH (CORE 1 - ARDUINO LOOP)
+// 7. MAIN LOOP (CORE 1 - ARDUINO LOOP)
 // ==============================================================================
 void loop() {
-    // 1. Phục vụ Web Browser & REST API
+    // 1. Handle web browser requests & REST API
     webServer.handle();
 
-    // 2. Đọc dữ liệu nhập từ Serial Monitor
+    // 2. Handle ArduinoOTA firmware updates
+    ArduinoOTA.handle();
+
+    // 3. Read serial input (bounded to 256 chars to prevent heap exhaustion)
     while (Serial.available()) {
         char inChar = (char)Serial.read();
         if (inChar == '\n' || inChar == '\r') {
             if (inputString.length() > 0) stringComplete = true;
         } else {
-            inputString += inChar;
+            if (inputString.length() < 256) {
+                inputString += inChar;
+            }
         }
     }
 

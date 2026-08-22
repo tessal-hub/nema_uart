@@ -4,6 +4,7 @@
 Motor::Motor(HardwareSerial* serial, float rSense, uint8_t uartAddress,
              uint8_t stepPinNum, uint8_t dirPinNum, const char* motorLabel)
     : serialPort(serial),
+      uartMutex(nullptr),
       driver(nullptr),
       stepPin(stepPinNum),
       dirPin(dirPinNum),
@@ -11,6 +12,7 @@ Motor::Motor(HardwareSerial* serial, float rSense, uint8_t uartAddress,
       label(motorLabel),
       running(false),
       dirCW(true),
+      lastShaftDir(-1),
       targetSpeedUs(DEFAULT_STEP_INTERVAL_US),
       currentSpeedUs(MAX_STEP_INTERVAL_US),
       startSpeedUs(MAX_STEP_INTERVAL_US),
@@ -38,7 +40,10 @@ Motor::~Motor() {
         esp_timer_delete(stepTimer);
         stepTimer = nullptr;
     }
-    delete driver;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdelete-non-virtual-dtor"
+    delete driver;  // TMC2209Stepper has no virtual dtor; safe because we know the concrete type
+#pragma GCC diagnostic pop
 }
 
 // Hàm nội suy S-Curve Smoothstep: S(x) = 3*x^2 - 2*x^3
@@ -67,85 +72,120 @@ void IRAM_ATTR Motor::onStepTimer(void* arg) {
     Motor* self = static_cast<Motor*>(arg);
     if (!self->running) return;
 
-    // 1. Tạo xung bước phần cứng tối ưu
+    // 1. Generate step pulse HIGH (TMC2209 min pulse ≥1µs; the ISR overhead itself
+    //    provides the required pulse width before the CLEAR gpio below executes)
     gpio_set_level((gpio_num_t)self->stepPin, 1);
-    delayMicroseconds(1);
-    gpio_set_level((gpio_num_t)self->stepPin, 0);
 
-    // 2. Xử lý S-Curve Ramping
+    // 2. Compute the next interval BEFORE clearing the pin so the GPIO HIGH time
+    //    is at least the instruction-execution time (~200ns on 240MHz core).
+    //    Then determine new interval via S-Curve.
+    uint32_t nextInterval = self->targetSpeedUs;
+
     if (!self->continuousMode && self->stepsRemaining > 0 && self->stepsRemaining != 0xFFFFFFFF) {
         self->stepCounter++;
         self->stepsRemaining--;
 
-        // Pha tăng tốc S-Curve (Acceleration)
+        // Acceleration phase
         if (self->stepCounter < self->accelSteps) {
-            self->currentSpeedUs = calculateSCurveInterval(self->stepCounter, self->accelSteps,
-                                                           self->startSpeedUs, self->targetSpeedUs);
+            nextInterval = calculateSCurveInterval(self->stepCounter, self->accelSteps,
+                                                   self->startSpeedUs, self->targetSpeedUs);
         }
-        // Pha giảm tốc S-Curve (Deceleration)
+        // Deceleration phase
         else if (self->stepsRemaining <= self->decelSteps) {
-            self->currentSpeedUs = calculateSCurveInterval(self->stepsRemaining, self->decelSteps,
-                                                           self->startSpeedUs, self->targetSpeedUs);
-        }
-        // Pha chạy đều (Cruise)
-        else {
-            self->currentSpeedUs = self->targetSpeedUs;
+            nextInterval = calculateSCurveInterval(self->stepsRemaining, self->decelSteps,
+                                                   self->startSpeedUs, self->targetSpeedUs);
         }
 
-        // Kiểm tra hoàn thành bước
+        self->currentSpeedUs = nextInterval;
+
+        // Terminate when all steps done
         if (self->stepsRemaining == 0) {
+            gpio_set_level((gpio_num_t)self->stepPin, 0);
             self->running = false;
-            esp_timer_stop(self->stepTimer);
-            return;
+            return;          // Timer is one-shot; do NOT reschedule
         }
     } else if (self->continuousMode) {
-        // Chế độ quay liên tục với S-Curve tăng tốc mượt
+        // Continuous mode — accelerate then cruise
         if (self->stepCounter < self->accelSteps) {
             self->stepCounter++;
-            self->currentSpeedUs = calculateSCurveInterval(self->stepCounter, self->accelSteps,
-                                                           self->startSpeedUs, self->targetSpeedUs);
-        } else {
-            self->currentSpeedUs = self->targetSpeedUs;
+            nextInterval = calculateSCurveInterval(self->stepCounter, self->accelSteps,
+                                                   self->startSpeedUs, self->targetSpeedUs);
         }
+        self->currentSpeedUs = nextInterval;
     }
 
-    // Cập nhật chu kỳ ngắt timer nếu tốc độ thay đổi
-    if (self->stepTimer != nullptr && self->running) {
-        uint32_t interval = self->currentSpeedUs;
-        if (interval < MIN_STEP_INTERVAL_US) interval = MIN_STEP_INTERVAL_US;
-        if (interval > MAX_STEP_INTERVAL_US) interval = MAX_STEP_INTERVAL_US;
-        esp_timer_restart(self->stepTimer, interval);
-    }
+    // 3. Clamp interval
+    if (nextInterval < MIN_STEP_INTERVAL_US) nextInterval = MIN_STEP_INTERVAL_US;
+    if (nextInterval > MAX_STEP_INTERVAL_US) nextInterval = MAX_STEP_INTERVAL_US;
+
+    // 4. Re-arm timer for the next step (one-shot)
+    esp_timer_start_once(self->stepTimer, nextInterval);
+
+    // 5. Clear step pin — done AFTER re-arming so scheduling latency doesn't
+    //    eat into pulse width. The pin will be HIGH for at least the time it took
+    //    to execute steps 2-4 (~1–2µs at 240 MHz), satisfying TMC2209's 100ns min.
+    gpio_set_level((gpio_num_t)self->stepPin, 0);
 }
 
 bool Motor::testUART() {
-    if (serialPort != nullptr) {
-        while (serialPort->available()) {
-            serialPort->read();
+    bool ok = false;
+    if (uartMutex != nullptr && *uartMutex != nullptr) {
+        if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            if (serialPort != nullptr) {
+                while (serialPort->available()) serialPort->read();
+            }
+            uint8_t v = driver->version();
+            driverVersion = v;
+            uartOk = (v == 0x21); // TMC2209 chuẩn trả về 0x21
+            ok = uartOk;
+            xSemaphoreGive(*uartMutex);
         }
+    } else {
+        if (serialPort != nullptr) {
+            while (serialPort->available()) serialPort->read();
+        }
+        uint8_t v = driver->version();
+        driverVersion = v;
+        uartOk = (v == 0x21);
+        ok = uartOk;
     }
-    uint8_t v = driver->version();
-    driverVersion = v;
-    uartOk = (v == 0x21); // TMC2209 chuẩn trả về 0x21
-    return uartOk;
+    return ok;
 }
 
 TMC2209Diag Motor::getDriverStatus() {
-    TMC2209Diag diag = {0};
-    diag.uartOk = testUART();
-    diag.driverVersion = driverVersion;
+    TMC2209Diag diag = {};
 
-    if (diag.uartOk) {
-        uint32_t drvStatus = driver->DRV_STATUS();
-        diag.overTemp        = (drvStatus & (1UL << 1)) != 0;
-        diag.overTempWarning = (drvStatus & (1UL << 0)) != 0;
-        diag.shortToGndA     = (drvStatus & (1UL << 2)) != 0;
-        diag.shortToGndB     = (drvStatus & (1UL << 3)) != 0;
-        diag.openLoadA       = (drvStatus & (1UL << 4)) != 0;
-        diag.openLoadB       = (drvStatus & (1UL << 5)) != 0;
-        diag.standStill      = (drvStatus & (1UL << 31)) != 0;
-        diag.csActual        = (drvStatus >> 16) & 0x1F;
-        diag.sgResult        = driver->SG_RESULT();
+    auto doRead = [&]() {
+        if (serialPort) { while (serialPort->available()) serialPort->read(); }
+        uint8_t v = driver->version();
+        driverVersion = v;
+        uartOk = (v == 0x21);
+        diag.uartOk = uartOk;
+        diag.driverVersion = driverVersion;
+
+        if (uartOk) {
+            if (serialPort) { while (serialPort->available()) serialPort->read(); }
+            uint32_t drvStatus = driver->DRV_STATUS();
+            diag.overTemp        = (drvStatus & (1UL << 1)) != 0;
+            diag.overTempWarning = (drvStatus & (1UL << 0)) != 0;
+            diag.shortToGndA     = (drvStatus & (1UL << 2)) != 0;
+            diag.shortToGndB     = (drvStatus & (1UL << 3)) != 0;
+            diag.openLoadA       = (drvStatus & (1UL << 4)) != 0;
+            diag.openLoadB       = (drvStatus & (1UL << 5)) != 0;
+            diag.standStill      = (drvStatus & (1UL << 31)) != 0;
+            diag.csActual        = (drvStatus >> 16) & 0x1F;
+            if (serialPort) { while (serialPort->available()) serialPort->read(); }
+            diag.sgResult        = driver->SG_RESULT();
+        }
+    };
+
+    if (uartMutex != nullptr && *uartMutex != nullptr) {
+        if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            doRead();
+            xSemaphoreGive(*uartMutex);
+        }
+    } else {
+        doRead();
     }
     return diag;
 }
@@ -169,11 +209,22 @@ void Motor::begin(uint16_t initialCurrentMa, uint16_t initialMicrosteps,
     esp_timer_create_args_t timerArgs = {
         .callback = &Motor::onStepTimer,
         .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "motor_step_timer",
+        .dispatch_method = ESP_TIMER_TASK,  // Note: ESP_TIMER_ISR requires IDF 5.2+; using TASK for IDF 5.1 compat.
+        .name = "motor_step",
         .skip_unhandled_events = true
     };
-    esp_timer_create(&timerArgs, &stepTimer);
+    esp_err_t ret = esp_timer_create(&timerArgs, &stepTimer);
+    if (ret != ESP_OK) {
+        Serial.printf("  >> [ERROR] %s: esp_timer_create failed: %d\n", label, ret);
+        stepTimer = nullptr;
+    }
+
+    if (uartMutex != nullptr && *uartMutex != nullptr) {
+        xSemaphoreTake(*uartMutex, portMAX_DELAY);
+    }
+    if (serialPort != nullptr) {
+        while (serialPort->available()) serialPort->read();
+    }
 
     driver->begin();
     driver->toff(4);
@@ -188,7 +239,15 @@ void Motor::begin(uint16_t initialCurrentMa, uint16_t initialMicrosteps,
     microstepsVal = initialMicrosteps;
     driver->microsteps(microstepsVal);
 
-    setChopperMode(initialSpreadCycle);
+    spreadCycleMode = initialSpreadCycle;
+    driver->en_spreadCycle(spreadCycleMode);
+    if (spreadCycleMode) {
+        driver->pwm_autoscale(false);
+        driver->pwm_autograd(false);
+    } else {
+        driver->pwm_autoscale(true);
+        driver->pwm_autograd(true);
+    }
 
     holdScale = initialHoldScale;
     driver->ihold(holdScale);
@@ -196,6 +255,11 @@ void Motor::begin(uint16_t initialCurrentMa, uint16_t initialMicrosteps,
 
     // Initial direction
     driver->shaft(false);
+    lastShaftDir = 0;
+
+    if (uartMutex != nullptr && *uartMutex != nullptr) {
+        xSemaphoreGive(*uartMutex);
+    }
 
     // Test UART
     testUART();
@@ -208,19 +272,40 @@ void Motor::begin(uint16_t initialCurrentMa, uint16_t initialMicrosteps,
     }
 }
 
+void Motor::setDirection(bool cw) {
+    dirCW = cw;
+
+    // 1. Hardware DIR pin control (0ms delay GPIO switch)
+    if (dirPin != 255) {
+        gpio_set_level((gpio_num_t)dirPin, cw ? 1 : 0);
+    }
+
+    // 2. UART register direction control - CHỈ gửi UART khi chiều thực sự THAY ĐỔI
+    if (lastShaftDir != (int8_t)cw) {
+        if (uartMutex != nullptr && *uartMutex != nullptr) {
+            if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(25)) == pdTRUE) {
+                if (serialPort != nullptr) {
+                    while (serialPort->available()) serialPort->read();
+                }
+                driver->shaft(!cw);
+                lastShaftDir = (int8_t)cw;
+                xSemaphoreGive(*uartMutex);
+            }
+        } else {
+            if (serialPort != nullptr) {
+                while (serialPort->available()) serialPort->read();
+            }
+            driver->shaft(!cw);
+            lastShaftDir = (int8_t)cw;
+        }
+    }
+}
+
 void Motor::run(bool cw, uint32_t steps) {
     if (!enabled) {
         enable(true);
     }
-    dirCW = cw;
-
-    // 1. Hardware DIR pin control (nếu có chân DIR vật lý)
-    if (dirPin != 255) {
-        digitalWrite(dirPin, cw ? HIGH : LOW);
-    }
-
-    // 2. UART register direction control
-    driver->shaft(!cw);
+    setDirection(cw);
 
     continuousMode = false;
     targetSteps = steps;
@@ -245,7 +330,7 @@ void Motor::run(bool cw, uint32_t steps) {
 
     if (stepTimer != nullptr) {
         esp_timer_stop(stepTimer);
-        esp_timer_start_periodic(stepTimer, currentSpeedUs);
+        esp_timer_start_once(stepTimer, currentSpeedUs);
     }
 }
 
@@ -253,12 +338,7 @@ void Motor::runContinuous(bool cw) {
     if (!enabled) {
         enable(true);
     }
-    dirCW = cw;
-
-    if (dirPin != 255) {
-        digitalWrite(dirPin, cw ? HIGH : LOW);
-    }
-    driver->shaft(!cw);
+    setDirection(cw);
 
     continuousMode = true;
     targetSteps = 0xFFFFFFFF;
@@ -275,7 +355,7 @@ void Motor::runContinuous(bool cw) {
 
     if (stepTimer != nullptr) {
         esp_timer_stop(stepTimer);
-        esp_timer_start_periodic(stepTimer, currentSpeedUs);
+        esp_timer_start_once(stepTimer, currentSpeedUs);
     }
 }
 
@@ -294,10 +374,26 @@ void Motor::stop() {
 void Motor::enable(bool en) {
     enabled = en;
     if (en) {
-        driver->toff(4);
+        if (uartMutex != nullptr && *uartMutex != nullptr) {
+            if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                if (serialPort != nullptr) { while (serialPort->available()) serialPort->read(); }
+                driver->toff(4);
+                xSemaphoreGive(*uartMutex);
+            }
+        } else {
+            driver->toff(4);
+        }
     } else {
         stop();
-        driver->toff(0);
+        if (uartMutex != nullptr && *uartMutex != nullptr) {
+            if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                if (serialPort != nullptr) { while (serialPort->available()) serialPort->read(); }
+                driver->toff(0);
+                xSemaphoreGive(*uartMutex);
+            }
+        } else {
+            driver->toff(0);
+        }
     }
 }
 
@@ -312,55 +408,127 @@ void Motor::setSpeed(uint32_t intervalUs) {
 
 void Motor::setCurrent(uint16_t mA) {
     currentMa = mA;
-    driver->rms_current(currentMa);
+    if (uartMutex != nullptr && *uartMutex != nullptr) {
+        if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (serialPort != nullptr) { while (serialPort->available()) serialPort->read(); }
+            driver->rms_current(currentMa);
+            xSemaphoreGive(*uartMutex);
+        }
+    } else {
+        driver->rms_current(currentMa);
+    }
 }
 
 void Motor::setHold(uint8_t scale) {
     holdScale = scale;
-    driver->ihold(holdScale);
+    if (uartMutex != nullptr && *uartMutex != nullptr) {
+        if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (serialPort != nullptr) { while (serialPort->available()) serialPort->read(); }
+            driver->ihold(holdScale);
+            xSemaphoreGive(*uartMutex);
+        }
+    } else {
+        driver->ihold(holdScale);
+    }
 }
 
 void Motor::setChopperMode(bool spreadCycle) {
     spreadCycleMode = spreadCycle;
-    driver->en_spreadCycle(spreadCycleMode);
-    if (spreadCycleMode) {
-        driver->pwm_autoscale(false);
-        driver->pwm_autograd(false);
+    if (uartMutex != nullptr && *uartMutex != nullptr) {
+        if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (serialPort != nullptr) { while (serialPort->available()) serialPort->read(); }
+            driver->en_spreadCycle(spreadCycleMode);
+            if (spreadCycleMode) {
+                driver->pwm_autoscale(false);
+                driver->pwm_autograd(false);
+            } else {
+                driver->pwm_autoscale(true);
+                driver->pwm_autograd(true);
+            }
+            xSemaphoreGive(*uartMutex);
+        }
     } else {
-        driver->pwm_autoscale(true);
-        driver->pwm_autograd(true);
+        driver->en_spreadCycle(spreadCycleMode);
+        if (spreadCycleMode) {
+            driver->pwm_autoscale(false);
+            driver->pwm_autograd(false);
+        } else {
+            driver->pwm_autoscale(true);
+            driver->pwm_autograd(true);
+        }
     }
 }
 
 void Motor::setMicrosteps(uint16_t ms) {
     microstepsVal = ms;
-    driver->microsteps(ms);
+    if (uartMutex != nullptr && *uartMutex != nullptr) {
+        if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (serialPort != nullptr) { while (serialPort->available()) serialPort->read(); }
+            driver->microsteps(ms);
+            xSemaphoreGive(*uartMutex);
+        }
+    } else {
+        driver->microsteps(ms);
+    }
 }
 
 void Motor::update() {
-    // Pulse generation is handled at microsecond precision by esp_timer.
+    // Pulse generation is handled with hardware precision by esp_timer interrupt.
 }
 
 uint16_t Motor::getStallGuardResult() {
-    return driver->SG_RESULT();
+    uint16_t res = 0;
+    if (uartMutex != nullptr && *uartMutex != nullptr) {
+        if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (serialPort != nullptr) { while (serialPort->available()) serialPort->read(); }
+            res = driver->SG_RESULT();
+            xSemaphoreGive(*uartMutex);
+        }
+    } else {
+        res = driver->SG_RESULT();
+    }
+    return res;
 }
 
 void Motor::setStallGuardThreshold(uint8_t threshold) {
-    driver->SGTHRS(threshold);
+    if (uartMutex != nullptr && *uartMutex != nullptr) {
+        if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (serialPort != nullptr) { while (serialPort->available()) serialPort->read(); }
+            driver->SGTHRS(threshold);
+            xSemaphoreGive(*uartMutex);
+        }
+    } else {
+        driver->SGTHRS(threshold);
+    }
 }
 
 void Motor::setupStallGuard(uint8_t threshold, uint32_t tcoolthrs) {
     setChopperMode(false);
-    driver->pwm_autoscale(true);
-    driver->pwm_autograd(true);
-    driver->TCOOLTHRS(tcoolthrs);
-    driver->SGTHRS(threshold);
-    driver->semin(0);
-    driver->semax(0);
+    if (uartMutex != nullptr && *uartMutex != nullptr) {
+        if (xSemaphoreTake(*uartMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (serialPort != nullptr) { while (serialPort->available()) serialPort->read(); }
+            driver->pwm_autoscale(true);
+            driver->pwm_autograd(true);
+            driver->TCOOLTHRS(tcoolthrs);
+            driver->SGTHRS(threshold);
+            driver->semin(0);
+            driver->semax(0);
+            xSemaphoreGive(*uartMutex);
+        }
+    } else {
+        driver->pwm_autoscale(true);
+        driver->pwm_autograd(true);
+        driver->TCOOLTHRS(tcoolthrs);
+        driver->SGTHRS(threshold);
+        driver->semin(0);
+        driver->semax(0);
+    }
 }
 
 String Motor::toJson() const {
-    String j = "{";
+    String j;
+    j.reserve(256);
+    j = "{";
     j += "\"running\":" + String(running ? "true" : "false") + ",";
     j += "\"dir\":\"" + String(dirCW ? "cw" : "ccw") + "\",";
     j += "\"stepsRemaining\":" + String(stepsRemaining) + ",";

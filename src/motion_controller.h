@@ -19,7 +19,8 @@ enum ControllerTask {
     TASK_NONE,
     TASK_HOME,
     TASK_CALIB,
-    TASK_ZERO
+    TASK_ZERO,
+    TASK_AUTODIR
 };
 
 class MotionController {
@@ -67,6 +68,7 @@ private:
 
     uint16_t normalCurrentMa;
     uint16_t homingCurrentMa;
+    uint8_t stallThreshold;
 
     volatile ControllerTask pendingTask;
 
@@ -80,6 +82,9 @@ public:
 
     void begin();
     void update();
+
+    // Auto Direction & Polarity Detection (Tự động phát hiện hộp số đảo / nam châm ngược)
+    bool detectAndAutoSetDirection(bool returnToStart = true);
 
     // Calibration
     void runAutoCalibration();
@@ -108,6 +113,10 @@ public:
     void triggerHome() { pendingTask = TASK_HOME; }
     void triggerCalib() { pendingTask = TASK_CALIB; }
     void triggerZero() { pendingTask = TASK_ZERO; }
+    void triggerAutoDir() { pendingTask = TASK_AUTODIR; }
+
+    bool hasPendingTask() const { return pendingTask != TASK_NONE; }
+    void executePendingTask();
 
     // Angle queries
     float getCorrectedAngle();
@@ -130,6 +139,8 @@ public:
     float getGearRatio() const { return gearRatio; }
     uint32_t getSpeed() const { return baseIntervalUs; }
     uint16_t getCurrentMa() const { return normalCurrentMa; }
+    uint16_t getHomingCurrentMa() const { return homingCurrentMa; }
+    uint8_t getStallThreshold() const { return stallThreshold; }
     bool getClosedLoopHold() const { return closedLoopHold; }
     bool getDirInvert() const { return dirInvert; }
     float getDeadbandEnter() const { return deadbandEnter; }
@@ -140,6 +151,8 @@ public:
 
     void setSpeed(uint32_t speedUs);
     void setCurrent(uint16_t ma);
+    void setHomingCurrent(uint16_t ma);
+    void setStallThreshold(uint8_t th);
     void setGearRatio(float ratio);
     void setLimits(float minDeg, float maxDeg);
     void setClosedLoopHold(bool hold) { closedLoopHold = hold; saveSettings(); }

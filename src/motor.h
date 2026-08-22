@@ -24,6 +24,7 @@ struct TMC2209Diag {
 class Motor {
 private:
     HardwareSerial* serialPort;
+    SemaphoreHandle_t* uartMutex;
     TMC2209Stepper* driver;
     uint8_t stepPin;
     uint8_t dirPin;
@@ -33,6 +34,7 @@ private:
     // Trạng thái vận hành bước (Được bảo vệ volatile và nguyên tử trong ISR)
     volatile bool running;
     volatile bool dirCW;
+    int8_t lastShaftDir;                  // Bộ đệm lưu chiều quay UART đã gửi (-1: chưa khởi tạo)
     volatile uint32_t targetSpeedUs;      // Tốc độ đích mong muốn (us/step)
     volatile uint32_t currentSpeedUs;     // Tốc độ tức thời đang chạy (us/step)
     volatile uint32_t startSpeedUs;       // Tốc độ xuất phát (us/step)
@@ -63,6 +65,8 @@ public:
           uint8_t stepPinNum, uint8_t dirPinNum = 255, const char* motorLabel = "Motor");
     ~Motor();
 
+    void setUartMutex(SemaphoreHandle_t* mutex) { uartMutex = mutex; }
+
     void begin(uint16_t initialCurrentMa = DEFAULT_NORMAL_CURRENT,
                uint16_t initialMicrosteps = DEFAULT_MICROSTEPS,
                bool initialSpreadCycle = true,
@@ -70,6 +74,7 @@ public:
                uint8_t iholddelay = 10);
 
     // Điều khiển chuyển động
+    void setDirection(bool cw);
     void run(bool cw, uint32_t steps);
     void runContinuous(bool cw);
     void stop();                          // Dừng khẩn cấp tức thời

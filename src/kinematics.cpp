@@ -222,13 +222,13 @@ bool ArmKinematics::solveIK(const CartesianPose& targetPose,
     float minReach = fabsf(L2 - L3_eff) + 1.0f;
 
     if (S > maxReach) {
-        float scale = maxReach / S;
+        float scale = maxReach / (S > 0.001f ? S : 0.001f);
         Rw *= scale;
         Yarm *= scale;
         S = maxReach;
         S_squared = S * S;
     } else if (S < minReach) {
-        float scale = minReach / S;
+        float scale = minReach / (S > 0.001f ? S : 0.001f);
         Rw *= scale;
         Yarm *= scale;
         S = minReach;
